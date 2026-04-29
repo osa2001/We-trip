@@ -41,7 +41,7 @@ export async function GET(request: NextRequest) {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": apiKey,
-          "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.types,places.priceLevel,places.rating,places.photos"
+          "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.types,places.priceLevel,places.rating,places.userRatingCount,places.photos,places.editorialSummary"
         },
         body: JSON.stringify(body)
       });
@@ -68,9 +68,24 @@ export async function GET(request: NextRequest) {
         headers: {
           "Content-Type": "application/json",
           "X-Goog-Api-Key": apiKey,
-          "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.types,places.priceLevel,places.rating,places.userRatingCount,places.photos"
+          "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.types,places.priceLevel,places.rating,places.userRatingCount,places.photos,places.editorialSummary"
         },
         body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      return NextResponse.json(data);
+
+    } else if (type === "details") {
+      const placeId = searchParams.get("placeId");
+      if (!placeId) {
+        return NextResponse.json({ error: "Missing placeId" }, { status: 400 });
+      }
+      const url = `https://places.googleapis.com/v1/places/${encodeURIComponent(placeId)}`;
+      const res = await fetch(url, {
+        headers: {
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask": "id,displayName,formattedAddress,location,types,priceLevel,rating,userRatingCount,photos,editorialSummary"
+        }
       });
       const data = await res.json();
       return NextResponse.json(data);

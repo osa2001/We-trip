@@ -3,6 +3,27 @@
 let googleMap = null;
 let mapMarkers = [];
 let mapPolylines = [];
+const travelMatrixCache = new Map();
+let supabaseBrowserClient = null;
+let activeInviteTrip = null;
+let activeMembersChannel = null;
+window._activeTripId = window._activeTripId || null;
+let sharedTripId = null;
+let currentSharedMemberName = null;
+let isSharedPlanner = false;
+let memberSaveTimer = null;
+const placeDetailsCache = new Map();
+const localWishlist = new Set();
+let cityAutocomplete = null;
+let countryAutocomplete = null;
+let departureAirportAutocomplete = null;
+let arrivalAirportAutocomplete = null;
+const hotelAreaAutocompletes = new Map();
+const wishlistState = {
+  counts: new Map(),
+  mine: new Set()
+};
+let guideState = null;
 
 // vibe 类型映射到 Google Places includedTypes
 const vibeToPlaceTypes = {
@@ -64,6 +85,7 @@ function normalizePlaceFromAPI(apiPlace, vibe, cityCenter) {
   const imageUrl = photoName
     ? `/api/photo?name=${encodeURIComponent(photoName)}`
     : "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=900&q=82";
+  const editorialSummary = apiPlace.editorialSummary?.text || "";
   return [
     apiPlace.displayName?.text || apiPlace.name,
     vibe,
@@ -74,12 +96,17 @@ function normalizePlaceFromAPI(apiPlace, vibe, cityCenter) {
     apiPlace.formattedAddress || "",
     imageUrl,
     apiPlace.location.latitude,
-    apiPlace.location.longitude
+    apiPlace.location.longitude,
+    "",
+    editorialSummary,
+    apiPlace.id || "",
+    apiPlace.userRatingCount || 0
   ];
 }
 
 // 获取城市中心坐标（调用 /api/geocode）
 async function getCityCenter(city, country) {
+
   try {
     const query = encodeURIComponent(`${city}, ${country}`);
     const res = await fetch(`/api/geocode?address=${query}`);
@@ -92,27 +119,53 @@ async function getCityCenter(city, country) {
 // 获取系统推荐地点（调用 /api/places）
 async function fetchSystemPlaces(cityCenter, vibes, city = "") {
   if (!cityCenter) return [];
+
   try {
-    const allTypes = [...new Set(
+    const vibeTypes = [...new Set(
       vibes.flatMap((v) => (vibeToPlaceTypes[v] || "tourist_attraction").split(","))
     )].slice(0, 5).join(",");
+    const landmarkTypes = [
+      "tourist_attraction",
+      "museum",
+      "historical_landmark",
+      "cultural_landmark",
+      "art_gallery"
+    ].join(",");
 
-    const res = await fetch(
-      `/api/places?type=recommendations` +
-      `&lat=${cityCenter.lat}&lng=${cityCenter.lng}` +
-      `&includedTypes=${encodeURIComponent(allTypes)}` +
-      `&destination=${encodeURIComponent(city || state.latestTrip?.destination || "")}`
-    );
-    const data = await res.json();
-    if (!data.places) return [];
+    const fetchRecommendationsByTypes = async (includedTypes) => {
+      const res = await fetch(
+        `/api/places?type=recommendations` +
+        `&lat=${cityCenter.lat}&lng=${cityCenter.lng}` +
+        `&includedTypes=${encodeURIComponent(includedTypes)}` +
+        `&destination=${encodeURIComponent(city || state.latestTrip?.destination || "")}`
+      );
+      const data = await res.json();
+      return data.places || [];
+    };
+
+    const [vibePlaces, landmarkPlaces] = await Promise.all([
+      fetchRecommendationsByTypes(vibeTypes),
+      fetchRecommendationsByTypes(landmarkTypes)
+    ]);
+
+    const placesById = new Map();
+    [...vibePlaces, ...landmarkPlaces].forEach((place) => {
+      const id = place.id || place.name || place.displayName?.text;
+      if (!id || placesById.has(id)) return;
+      placesById.set(id, place);
+    });
 
     // 过滤质量
-    return data.places
+    return [...placesById.values()]
       .filter((p) => {
         const minCount = getMinRatingCount(city || state.latestTrip?.destination || "");
         return p.rating >= 4.0 && p.userRatingCount >= minCount;
       })
-      .slice(0, 12)
+      .sort((a, b) =>
+        (b.rating || 0) - (a.rating || 0) ||
+        (b.userRatingCount || 0) - (a.userRatingCount || 0)
+      )
+      .slice(0, 20)
       .map((p) => {
         // 推断 vibe
         const inferredVibe = vibes.find((v) =>
@@ -127,19 +180,161 @@ async function fetchSystemPlaces(cityCenter, vibes, city = "") {
   }
 }
 
-// 获取真实交通时间（调用 /api/routes）
-async function fetchTravelMatrix(places, hotelAreas) {
-  void hotelAreas;
-  if (!places.length) return null;
+// 获取真实交通时间（调用 /api/routes），按坐标缓存避免重复请求
+async function fetchTravelMatrix(origin, destination) {
+  if (!origin?.lat || !origin?.lng || !destination?.lat || !destination?.lng) return null;
+  const key = `${origin.lat},${origin.lng}-${destination.lat},${destination.lng}`;
+  if (travelMatrixCache.has(key)) return travelMatrixCache.get(key);
+
+  const requestRoute = async (travelMode) => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+    const res = await fetch("/api/routes", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      signal: controller.signal,
+      body: JSON.stringify({
+        origins: [{ lat: origin.lat, lng: origin.lng }],
+        destinations: [{ lat: destination.lat, lng: destination.lng }],
+        travelMode
+      })
+    }).finally(() => clearTimeout(timeout));
+    if (!res.ok) return null;
+    return parseRouteMatrixEntry(await res.json());
+  };
+
+
   try {
-    // 需要真实 GPS 坐标才能调用
-    // 暂时返回 null，用现有距离估算作为 fallback
-    return null;
+    const [transit, drive] = await Promise.all([
+      requestRoute("TRANSIT"),
+      requestRoute("DRIVE")
+    ]);
+    const result = transit || drive ? { transit, drive } : null;
+    travelMatrixCache.set(key, result);
+    return result;
   } catch {
+    travelMatrixCache.set(key, null);
     return null;
   }
 }
-void fetchTravelMatrix;
+
+async function fetchTransitMatrix(origin, destination) {
+  if (!origin?.lat || !origin?.lng || !destination?.lat || !destination?.lng) return null;
+  const key = `${origin.lat},${origin.lng}-${destination.lat},${destination.lng}`;
+  const cached = travelMatrixCache.get(key);
+  if (cached?.transit) return cached.transit;
+
+
+  try {
+    const transit = await requestRouteMatrix(origin, destination, "TRANSIT");
+    travelMatrixCache.set(key, { ...(cached || {}), transit });
+    return transit;
+  } catch {
+    travelMatrixCache.set(key, cached || null);
+    return null;
+  }
+}
+
+async function fetchDriveMatrix(origin, destination) {
+  if (!origin?.lat || !origin?.lng || !destination?.lat || !destination?.lng) return null;
+  const key = `${origin.lat},${origin.lng}-${destination.lat},${destination.lng}`;
+  const cached = travelMatrixCache.get(key);
+  if (cached?.drive) return cached.drive;
+
+
+  try {
+    const drive = await requestRouteMatrix(origin, destination, "DRIVE");
+    travelMatrixCache.set(key, { ...(cached || {}), drive });
+    return drive;
+  } catch {
+    travelMatrixCache.set(key, cached || null);
+    return null;
+  }
+}
+
+async function requestRouteMatrix(origin, destination, travelMode) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5000);
+  const res = await fetch("/api/routes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal: controller.signal,
+    body: JSON.stringify({
+      origins: [{ lat: origin.lat, lng: origin.lng }],
+      destinations: [{ lat: destination.lat, lng: destination.lng }],
+      travelMode
+    })
+  }).finally(() => clearTimeout(timeout));
+  if (!res.ok) return null;
+  return parseRouteMatrixEntry(await res.json());
+}
+
+function parseRouteMatrixEntry(data) {
+  const entry = Array.isArray(data) ? data[0] : data;
+  if (!entry || entry.error || entry.status?.code || entry.condition === "ROUTE_NOT_FOUND") return null;
+  const minutes = parseDurationMinutes(entry.duration || entry.localizedValues?.duration?.text);
+  if (!minutes) return null;
+  return {
+    minutes,
+    distanceMeters: Number(entry.distanceMeters || 0),
+    raw: entry
+  };
+}
+
+function parseDurationMinutes(value) {
+  if (!value) return 0;
+  if (typeof value === "number") return Math.round(value / 60);
+  const secondsMatch = String(value).match(/^([\d.]+)s$/);
+  if (secondsMatch) return Math.round(Number(secondsMatch[1]) / 60);
+  const hourMatch = String(value).match(/(\d+)\s*h/i);
+  const minuteMatch = String(value).match(/(\d+)\s*m/i);
+  if (hourMatch || minuteMatch) {
+    return Number(hourMatch?.[1] || 0) * 60 + Number(minuteMatch?.[1] || 0);
+  }
+  return 0;
+}
+
+async function preloadTravelMatrices(places = [], hotelAreas = []) {
+  const importantPlaces = places
+    .filter((place) => place?.lat && place?.lng)
+    .sort((a, b) => (b.nominations?.length || 0) - (a.nominations?.length || 0))
+    .slice(0, 18);
+  const hotels = hotelAreas.filter((hotel) => hotel?.lat && hotel?.lng);
+  const jobs = [];
+
+  for (const hotel of hotels) {
+    for (const place of importantPlaces) {
+      jobs.push([hotel, place]);
+      jobs.push([place, hotel]);
+    }
+  }
+
+  for (let i = 0; i < importantPlaces.length; i += 1) {
+    for (let j = i + 1; j < importantPlaces.length; j += 1) {
+      if (importantPlaces[i].city && importantPlaces[j].city && importantPlaces[i].city !== importantPlaces[j].city) continue;
+      jobs.push([importantPlaces[i], importantPlaces[j]]);
+      jobs.push([importantPlaces[j], importantPlaces[i]]);
+    }
+  }
+
+  const cappedJobs = jobs.slice(0, 160);
+  const workers = Array.from({ length: 6 }, async (_, workerIndex) => {
+    for (let index = workerIndex; index < cappedJobs.length; index += 6) {
+      const [origin, destination] = cappedJobs[index];
+      await fetchTravelMatrix(origin, destination);
+    }
+  });
+  await Promise.race([
+    Promise.all(workers),
+    new Promise((resolve) => setTimeout(resolve, 7000))
+  ]);
+}
+
+function getCachedTravelMatrix(origin, destination) {
+  if (!origin?.lat || !origin?.lng || !destination?.lat || !destination?.lng) return null;
+  const key = `${origin.lat},${origin.lng}-${destination.lat},${destination.lng}`;
+  return travelMatrixCache.get(key) || null;
+}
 
 // 提名搜索防抖
 let nominationDebounceTimer = null;
@@ -147,6 +342,7 @@ let nominationDebounceTimer = null;
 async function searchNominationPlaces(query, cityCenter) {
   console.log("searchNominationPlaces called:", query, cityCenter);
   if (!query || query.length < 2) return [];
+
   try {
     const params = new URLSearchParams({
       query,
@@ -209,120 +405,85 @@ const DAY_COLORS = [
   "#6c5ce7", "#00cec9", "#fd79a8", "#f0a04b", "#a29bfe"
 ];
 
+// 打车费用参考单价表（USD，白天基础价，仅供参考）
+// 数据来源：各国出租车协会/政府公示计价标准，汇率按近似值换算
+// 如需更新：修改 base（起步价）和 perKm（每公里单价）即可
+const taxiRateUSD = {
+  "Japan": { base: 4.5, perKm: 3.8 }, // 日本全国均值，东京略高
+  "South Korea": { base: 3.0, perKm: 1.3 }, // 首尔普通计程车
+  "Thailand": { base: 1.5, perKm: 0.7 }, // 曼谷起步35泰铢
+  "Singapore": { base: 3.5, perKm: 1.5 }, // 含ERP路费估算
+  "France": { base: 4.5, perKm: 2.3 }, // 巴黎G7标准
+  "Italy": { base: 4.0, perKm: 1.8 }, // 罗马/米兰市区
+  "Spain": { base: 3.5, perKm: 1.5 }, // 马德里/巴塞罗那
+  "UK": { base: 5.0, perKm: 3.2 }, // 伦敦黑的士
+  "Germany": { base: 4.0, perKm: 2.0 }, // 柏林/慕尼黑
+  "USA": { base: 3.5, perKm: 2.0 }, // 纽约/LA Uber均值
+  "Australia": { base: 4.0, perKm: 1.8 }, // 悉尼/墨尔本
+  "UAE": { base: 3.0, perKm: 1.2 }, // 迪拜RTA标准
+  "default": { base: 3.0, perKm: 1.8 } // 未收录国家的fallback
+};
+
 const countryCities = {
   Japan: ["Tokyo", "Osaka", "Kyoto", "Hiroshima", "Nara", "Sapporo", "Fukuoka", "Yokohama", "Kamakura", "Nikko"],
-  England: ["London", "Manchester", "Birmingham", "Edinburgh", "Liverpool", "Bristol", "Brighton", "Oxford", "Cambridge", "Bath"],
+  UK: ["London", "Manchester", "Birmingham", "Edinburgh", "Liverpool", "Bristol", "Brighton", "Oxford", "Cambridge", "Bath"],
   France: ["Paris", "Nice", "Lyon", "Marseille", "Bordeaux", "Strasbourg", "Toulouse", "Cannes", "Mont Saint-Michel", "Versailles"],
   Germany: ["Berlin", "Munich", "Hamburg", "Frankfurt", "Cologne", "Dresden", "Heidelberg", "Stuttgart", "Nuremberg", "Düsseldorf"],
   Spain: ["Barcelona", "Madrid", "Seville", "Valencia", "Granada", "Bilbao", "Toledo", "Salamanca", "San Sebastián", "Málaga"],
   Italy: ["Rome", "Florence", "Venice", "Milan", "Naples", "Amalfi Coast", "Cinque Terre", "Bologna", "Siena", "Verona"],
+  "South Korea": ["Seoul", "Busan", "Jeju", "Gyeongju", "Incheon", "Daegu"],
+  Thailand: ["Bangkok", "Chiang Mai", "Phuket", "Krabi", "Ayutthaya", "Pattaya"],
+  Singapore: ["Singapore"],
+  China: ["Beijing", "Shanghai", "Chengdu", "Xi'an", "Hangzhou", "Guangzhou"],
+  Australia: ["Sydney", "Melbourne", "Brisbane", "Perth", "Adelaide", "Cairns"],
+  UAE: ["Dubai", "Abu Dhabi", "Sharjah"],
+  Netherlands: ["Amsterdam", "Rotterdam", "The Hague", "Utrecht"],
+  Portugal: ["Lisbon", "Porto", "Sintra", "Faro"],
   Norway: ["Oslo", "Bergen", "Tromsø", "Stavanger", "Trondheim", "Ålesund", "Flåm", "Geirangerfjord", "Lofoten", "Kristiansand"],
   Finland: ["Helsinki", "Rovaniemi", "Tampere", "Turku", "Oulu", "Lappeenranta", "Espoo", "Porvoo", "Savonlinna", "Inari"],
+  Switzerland: ["Zurich", "Geneva", "Lucerne", "Interlaken", "Bern"],
+  Austria: ["Vienna", "Salzburg", "Innsbruck", "Graz"],
+  Greece: ["Athens", "Santorini", "Mykonos", "Thessaloniki"],
+  Turkey: ["Istanbul", "Cappadocia", "Antalya", "Izmir"],
+  Canada: ["Toronto", "Vancouver", "Montreal", "Quebec City", "Calgary"],
+  Mexico: ["Mexico City", "Cancun", "Oaxaca", "Guadalajara"],
+  Indonesia: ["Bali", "Jakarta", "Yogyakarta", "Ubud"],
+  Vietnam: ["Hanoi", "Ho Chi Minh City", "Da Nang", "Hoi An"],
+  Malaysia: ["Kuala Lumpur", "Penang", "Langkawi", "Malacca"],
+  "New Zealand": ["Auckland", "Queenstown", "Wellington", "Christchurch"],
+  "Czech Republic": ["Prague", "Český Krumlov", "Brno"],
+  Hungary: ["Budapest", "Eger", "Pécs"],
+  Ireland: ["Dublin", "Galway", "Cork"],
+  Denmark: ["Copenhagen", "Aarhus", "Odense"],
+  Sweden: ["Stockholm", "Gothenburg", "Malmö"],
+  Belgium: ["Brussels", "Bruges", "Antwerp", "Ghent"],
+  Croatia: ["Dubrovnik", "Split", "Zagreb", "Hvar"],
   USA: ["New York City", "Los Angeles", "San Francisco", "Las Vegas", "Miami", "Chicago", "New Orleans", "Seattle", "Washington DC", "Honolulu"]
 };
 
-const cityAreas = {
-  Tokyo: [
-    ["shibuya", "涩谷 / Shibuya", 55, 48],
-    ["ginza", "银座 / Ginza", 70, 33],
-    ["shinjuku", "新宿 / Shinjuku", 38, 65],
-    ["ueno", "上野 / Ueno", 47, 24]
-  ],
-  Kyoto: [
-    ["gion", "祇园 / Gion", 62, 48],
-    ["kawaramachi", "河原町 / Kawaramachi", 55, 52],
-    ["arashiyama", "嵐山 / Arashiyama", 22, 45],
-    ["kyoto-station", "京都站 / Kyoto Station", 52, 68],
-    ["kinkakuji", "北山 / Kinkakuji", 38, 28]
-  ],
-  Osaka: [
-    ["namba", "难波 / Namba", 52, 62],
-    ["umeda", "梅田 / Umeda", 48, 38],
-    ["dotonbori", "道顿堀 / Dotonbori", 54, 58],
-    ["tennoji", "天王寺 / Tennoji", 56, 72],
-    ["shinsekai", "新世界 / Shinsekai", 55, 68]
-  ],
-  London: [
-    ["west-end", "中心 / West End", 45, 42],
-    ["south-bank", "南岸 / South Bank", 52, 52],
-    ["shoreditch", "东区 / Shoreditch", 62, 38],
-    ["notting-hill", "诺丁山 / Notting Hill", 32, 40],
-    ["greenwich", "格林威治 / Greenwich", 68, 58]
-  ],
-  Paris: [
-    ["marais", "玛黑区 / Le Marais", 46, 38],
-    ["left-bank", "左岸 / Left Bank", 39, 56],
-    ["opera", "歌剧院 / Opéra", 51, 44],
-    ["montmartre", "蒙马特 / Montmartre", 54, 70]
-  ],
-  Berlin: [
-    ["mitte", "米特 / Mitte", 52, 42],
-    ["prenzlauer", "普伦茨劳贝格 / Prenzlauer Berg", 58, 32],
-    ["kreuzberg", "克罗伊茨贝格 / Kreuzberg", 54, 58],
-    ["charlottenburg", "夏洛滕堡 / Charlottenburg", 32, 40],
-    ["friedrichshain", "弗里德里希斯海因 / Friedrichshain", 65, 48]
-  ],
-  Rome: [
-    ["historic-center", "历史中心 / Historic Center", 52, 48],
-    ["vatican", "梵蒂冈 / Vatican", 38, 42],
-    ["trastevere", "特拉斯提弗列 / Trastevere", 44, 58],
-    ["spanish-steps", "西班牙广场 / Spanish Steps", 50, 38],
-    ["ostia", "奥斯蒂亚 / Ostia", 22, 72]
-  ],
-  Barcelona: [
-    ["gothic", "哥特区 / Gothic Quarter", 55, 52],
-    ["gracia", "格拉西亚 / Gràcia", 52, 38],
-    ["barceloneta", "巴塞罗内塔 / Barceloneta", 65, 58],
-    ["montjuic", "蒙特惠奇 / Montjuïc", 42, 65],
-    ["poblenou", "波布雷诺 / Poblenou", 68, 52]
-  ],
-  Oslo: [
-    ["center", "中心 / City Center", 52, 48],
-    ["grunerlokka", "格吕内洛卡 / Grünerløkka", 56, 38],
-    ["frogner", "弗罗格纳 / Frogner", 42, 42],
-    ["gronland", "格伦兰 / Grønland", 58, 52],
-    ["bygdoy", "比格达伊 / Bygdøy", 35, 52]
-  ],
-  Helsinki: [
-    ["center", "中心 / City Center", 52, 48],
-    ["kallio", "卡利奥 / Kallio", 58, 38],
-    ["kanavansatama", "卡纳瓦萨里 / Kanavasatama", 62, 52],
-    ["toolo", "图洛 / Töölö", 46, 38],
-    ["west-harbor", "西港 / West Harbor", 38, 52]
-  ],
-  "New York City": [
-    ["midtown", "曼哈顿中城 / Midtown", 52, 45],
-    ["downtown", "下城 / Downtown", 52, 62],
-    ["brooklyn", "布鲁克林 / Brooklyn", 60, 58],
-    ["upper-west", "上西区 / Upper West Side", 48, 32],
-    ["harlem", "哈莱姆 / Harlem", 50, 25]
-  ],
-  "Los Angeles": [
-    ["hollywood", "好莱坞 / Hollywood", 38, 42],
-    ["santa-monica", "圣莫尼卡 / Santa Monica", 22, 52],
-    ["downtown-la", "市中心 / Downtown", 52, 55],
-    ["beverly-hills", "贝弗利山 / Beverly Hills", 30, 46],
-    ["silverlake", "银湖 / Silver Lake", 48, 48]
-  ],
-  "San Francisco": [
-    ["union-square", "联合广场 / Union Square", 50, 48],
-    ["mission", "教会区 / Mission", 48, 58],
-    ["haight", "海特 / Haight-Ashbury", 38, 52],
-    ["fishermans-wharf", "渔人码头 / Fisherman's Wharf", 45, 35],
-    ["nob-hill", "诺布山 / Nob Hill", 48, 42]
-  ]
+// 酒店每晚费用参考单价表（USD，每间房，白天基础价，仅供参考）
+// 数据来源：各国主要旅游城市酒店均价（USD/间/晚，2024-2025年参考值）
+// 如需更新：修改对应国家的星级价格即可
+const hotelCostByCountry = {
+  "Japan": { 1: 50, 2: 90, 3: 150, 4: 250, 5: 500 }, // 东京/京都均值
+  "South Korea": { 1: 45, 2: 80, 3: 130, 4: 200, 5: 400 }, // 首尔均值
+  "Thailand": { 1: 25, 2: 50, 3: 90, 4: 150, 5: 350 }, // 曼谷均值
+  "Singapore": { 1: 80, 2: 140, 3: 220, 4: 350, 5: 700 }, // 新加坡均值
+  "France": { 1: 80, 2: 130, 3: 200, 4: 350, 5: 700 }, // 巴黎均值
+  "Italy": { 1: 70, 2: 120, 3: 180, 4: 300, 5: 600 }, // 罗马/米兰均值
+  "Spain": { 1: 60, 2: 100, 3: 160, 4: 260, 5: 500 }, // 马德里/巴塞罗那均值
+  "UK": { 1: 90, 2: 150, 3: 230, 4: 380, 5: 750 }, // 伦敦均值
+  "Germany": { 1: 70, 2: 110, 3: 170, 4: 280, 5: 550 }, // 柏林/慕尼黑均值
+  "USA": { 1: 80, 2: 130, 3: 200, 4: 320, 5: 650 }, // 纽约/LA均值
+  "Australia": { 1: 80, 2: 130, 3: 200, 4: 300, 5: 600 }, // 悉尼/墨尔本均值
+  "UAE": { 1: 70, 2: 120, 3: 200, 4: 350, 5: 700 }, // 迪拜均值
+  "China": { 1: 30, 2: 60, 3: 100, 4: 180, 5: 400 }, // 北京/上海均值
+  "Indonesia": { 1: 25, 2: 50, 3: 90, 4: 160, 5: 350 }, // 巴厘岛/雅加达均值
+  "Vietnam": { 1: 20, 2: 40, 3: 80, 4: 140, 5: 300 }, // 河内/胡志明均值
+  "Portugal": { 1: 60, 2: 100, 3: 160, 4: 260, 5: 500 }, // 里斯本均值
+  "Netherlands": { 1: 80, 2: 130, 3: 200, 4: 320, 5: 600 }, // 阿姆斯特丹均值
+  "default": { 1: 50, 2: 90, 3: 140, 4: 230, 5: 450 } // 未收录国家fallback
 };
-
-function getAreasForCity(city) {
-  return cityAreas[city] || [
-    ["center", `${city} Center`, 50, 50],
-    ["north", `${city} North`, 50, 30],
-    ["south", `${city} South`, 50, 70],
-    ["east", `${city} East`, 70, 50]
-  ];
-}
-
-const hotelCostUSD = { 1: 40, 2: 70, 3: 110, 4: 180, 5: 320 };
 const airportCoords = {
   NRT: { x: 90, y: 15 },
   HND: { x: 45, y: 85 },
@@ -338,253 +499,6 @@ const airportCoords = {
   SFO: { x: 18, y: 55 }
 };
 
-const destinationPlans = {
-  Tokyo: {
-    label: "东京，日本",
-    visaDays: { CN: 12, SG: 0, US: 0, MY: 0 },
-    center: "涩谷 - 代官山 - 清澄白河",
-    areas: [
-      ["shibuya", "涩谷 / 表参道", 55, 48],
-      ["ginza", "银座 / 东京站", 70, 33],
-      ["shinjuku", "新宿", 38, 65],
-      ["ueno", "上野 / 浅草", 47, 24]
-    ],
-    places: [
-      ["清澄白河咖啡街", "slow-cafe", 32, 23, 42, "步行 18 分钟", "从精品咖啡开始，把旅行节奏压低。", "https://images.unsplash.com/photo-1509042239860-f550ce710b93?auto=format&fit=crop&w=900&q=82"],
-      ["根津美术馆", "museum", 48, 33, 56, "公交 22 分钟", "庭园、展陈与安静茶室适合审美建模。", "https://images.unsplash.com/photo-1528360983277-13d401cdc186?auto=format&fit=crop&w=900&q=82"],
-      ["代官山 T-Site", "architecture", 61, 46, 68, "步行 14 分钟", "书店、生活方式和建筑立面很适合午后。", "https://images.unsplash.com/photo-1521587760476-6c12a4b040da?auto=format&fit=crop&w=900&q=82"],
-      ["中目黑河岸", "nature", 54, 62, 34, "步行 19 分钟", "低密度散步路线，适合作为当天缓冲。", "https://images.unsplash.com/photo-1493976040374-85c8e12f0c0e?auto=format&fit=crop&w=900&q=82"],
-      ["新宿黄金街", "night", 38, 70, 74, "地铁 25 分钟", "夜间分支点，适合小酒馆和深夜食堂。", "https://images.unsplash.com/photo-1542051841857-5f90071e7989?auto=format&fit=crop&w=900&q=82"],
-      ["筑地场外市场", "local-food", 72, 27, 58, "地铁 21 分钟", "把早餐预算花在高确定性的本地烟火。", "https://images.unsplash.com/photo-1553621042-f6e147245754?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Seoul: {
-    label: "首尔，韩国",
-    visaDays: { CN: 10, SG: 0, US: 0, MY: 0 },
-    center: "圣水 - 北村 - 汉南",
-    areas: [
-      ["hongdae", "弘大 / 延南", 35, 57],
-      ["myeongdong", "明洞 / 钟路", 55, 42],
-      ["seongsu", "圣水", 30, 35],
-      ["gangnam", "江南", 66, 63]
-    ],
-    places: [
-      ["圣水洞咖啡仓库", "slow-cafe", 27, 36, 38, "步行 12 分钟", "由工业空间改造出的慢节奏据点。", "https://images.unsplash.com/photo-1514933651103-005eec06c04b?auto=format&fit=crop&w=900&q=82"],
-      ["DDP 东大门设计广场", "architecture", 61, 39, 46, "地铁 18 分钟", "曲线建筑和夜间灯光都很强。", "https://images.unsplash.com/photo-1538485399081-7191377e8241?auto=format&fit=crop&w=900&q=82"],
-      ["北村韩屋村", "history", 50, 22, 24, "公交 26 分钟", "历史肌理清晰，适合轻步行。", "https://images.unsplash.com/photo-1534274867514-d5b47ef89ed7?auto=format&fit=crop&w=900&q=82"],
-      ["汉南洞买手街", "shopping", 42, 58, 82, "地铁 20 分钟", "品牌店与餐厅密度高，预算弹性大。", "https://images.unsplash.com/photo-1515886657613-9f3515b0c78f?auto=format&fit=crop&w=900&q=82"],
-      ["广藏市场", "local-food", 70, 51, 44, "地铁 16 分钟", "小吃和传统市场组合，适合作为晚餐点。", "https://images.unsplash.com/photo-1604908176997-125f25cc6f3d?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Bangkok: {
-    label: "曼谷，泰国",
-    visaDays: { CN: 0, SG: 0, US: 0, MY: 0 },
-    center: "老城 - 河岸 - 暹罗",
-    areas: [
-      ["siam", "暹罗 / Chit Lom", 62, 54],
-      ["riverside", "河岸", 35, 64],
-      ["old-town", "老城", 38, 29],
-      ["sukhumvit", "素坤逸", 72, 61]
-    ],
-    places: [
-      ["郑王庙河岸", "history", 37, 26, 22, "船运 16 分钟", "城市记忆和河岸光线是第一站。", "https://images.unsplash.com/photo-1563492065599-3520f775eeed?auto=format&fit=crop&w=900&q=82"],
-      ["Talat Noi 老街", "retro", 48, 43, 32, "步行 20 分钟", "复古机车、壁画和小店组成隐线。", "https://images.unsplash.com/photo-1508009603885-50cf7c579365?auto=format&fit=crop&w=900&q=82"],
-      ["暹罗设计中心", "architecture", 63, 55, 61, "地铁 18 分钟", "室内设计、展览和购物都集中。", "https://images.unsplash.com/photo-1567748157439-651aca2ff064?auto=format&fit=crop&w=900&q=82"],
-      ["唐人街夜市", "local-food", 72, 62, 48, "地铁 22 分钟", "预算友好的夜间烟火主线。", "https://images.unsplash.com/photo-1552465011-b4e21bf6e79a?auto=format&fit=crop&w=900&q=82"],
-      ["湄南河日落船", "nature", 29, 69, 74, "船运 28 分钟", "用水路替代拥堵地面交通。", "https://images.unsplash.com/photo-1528181304800-259b08848526?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Paris: {
-    label: "巴黎，法国",
-    visaDays: { CN: 18, SG: 0, US: 0, MY: 0 },
-    center: "玛黑 - 左岸 - 蒙马特",
-    areas: [
-      ["marais", "玛黑区", 46, 38],
-      ["left-bank", "左岸 / 圣日耳曼", 39, 56],
-      ["opera", "歌剧院 / 卢浮宫", 51, 44],
-      ["montmartre", "蒙马特", 54, 70]
-    ],
-    places: [
-      ["玛黑区画廊线", "museum", 41, 34, 64, "步行 15 分钟", "画廊、书店和咖啡店紧密连接。", "https://images.unsplash.com/photo-1502602898657-3e91760cbb34?auto=format&fit=crop&w=900&q=82"],
-      ["圣日耳曼咖啡", "slow-cafe", 33, 54, 70, "地铁 17 分钟", "经典咖啡馆场景，但控制停留预算。", "https://images.unsplash.com/photo-1543349689-9a4d426bee8e?auto=format&fit=crop&w=900&q=82"],
-      ["路易威登基金会", "architecture", 67, 31, 88, "公交 31 分钟", "建筑和展览强度高，适合核心锚点。", "https://images.unsplash.com/photo-1499856871958-5b9627545d1a?auto=format&fit=crop&w=900&q=82"],
-      ["蒙马特日落", "nature", 54, 70, 35, "地铁 24 分钟", "用高处视野收束一天路线。", "https://images.unsplash.com/photo-1522093007474-d86e9bf7ba6f?auto=format&fit=crop&w=900&q=82"],
-      ["圣旺跳蚤市场", "hidden", 73, 48, 52, "地铁 29 分钟", "小众淘物线，适合复古偏好。", "https://images.unsplash.com/photo-1519677100203-a0e668c92439?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  London: {
-    label: "伦敦，英国",
-    visaDays: { CN: 21, SG: 0, US: 0, MY: 0 },
-    center: "Soho - South Bank - Shoreditch",
-    areas: [
-      ["soho", "苏活 / 考文特花园", 48, 43],
-      ["south-bank", "南岸 / 滑铁卢", 54, 55],
-      ["shoreditch", "肖尔迪奇", 68, 35],
-      ["kensington", "肯辛顿", 30, 50]
-    ],
-    places: [
-      ["大英博物馆", "museum", 50, 36, 0, "地铁 14 分钟", "用世界级馆藏作为伦敦文化主锚点。", "https://images.unsplash.com/photo-1513635269975-59663e0ac1ad?auto=format&fit=crop&w=900&q=82"],
-      ["South Bank 河岸步道", "nature", 56, 56, 18, "步行 20 分钟", "泰晤士河景、剧场和街头表演组成低风险散步线。", "https://images.unsplash.com/photo-1529655683826-aba9b3e77383?auto=format&fit=crop&w=900&q=82"],
-      ["Shoreditch 红砖街区", "retro", 69, 34, 38, "地铁 24 分钟", "涂鸦、古着和咖啡店适合小众探索。", "https://images.unsplash.com/photo-1505761671935-60b3a7427bad?auto=format&fit=crop&w=900&q=82"],
-      ["Tate Modern", "museum", 58, 51, 0, "步行 18 分钟", "工业空间改造的现代艺术馆，适合文艺路线。", "https://images.unsplash.com/photo-1566127444979-b3d2b654e3d7?auto=format&fit=crop&w=900&q=82"],
-      ["Borough Market", "local-food", 62, 58, 42, "步行 16 分钟", "高确定性的本地市场午餐点。", "https://images.unsplash.com/photo-1515669097368-22e68427d265?auto=format&fit=crop&w=900&q=82"],
-      ["Covent Garden", "shopping", 49, 45, 64, "地铁 12 分钟", "剧院、生活方式店和餐厅密度高。", "https://images.unsplash.com/photo-1517394834181-95ed159986c7?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Berlin: {
-    label: "柏林，德国",
-    visaDays: { CN: 18, SG: 0, US: 0, MY: 0 },
-    center: "Mitte - Kreuzberg - Prenzlauer Berg",
-    areas: [
-      ["mitte", "米特区", 52, 40],
-      ["kreuzberg", "克罗伊茨贝格", 56, 62],
-      ["prenzlauer", "普伦茨劳贝格", 60, 28],
-      ["charlottenburg", "夏洛滕堡", 33, 47]
-    ],
-    places: [
-      ["博物馆岛", "museum", 54, 38, 26, "步行 15 分钟", "多馆集中，适合作为历史和艺术的高权重锚点。", "https://images.unsplash.com/photo-1560969184-10fe8719e047?auto=format&fit=crop&w=900&q=82"],
-      ["柏林墙东边画廊", "history", 67, 58, 0, "地铁 22 分钟", "城市记忆和街头艺术直接重叠。", "https://images.unsplash.com/photo-1587330979470-3595ac045ab0?auto=format&fit=crop&w=900&q=82"],
-      ["Kreuzberg 咖啡街", "slow-cafe", 55, 63, 32, "步行 18 分钟", "咖啡馆、唱片店和运河边散步形成慢节奏半日线。", "https://images.unsplash.com/photo-1453614512568-c4024d13c247?auto=format&fit=crop&w=900&q=82"],
-      ["包豪斯档案馆", "architecture", 42, 54, 18, "公交 24 分钟", "设计史和现代主义建筑偏好的精准匹配。", "https://images.unsplash.com/photo-1494526585095-c41746248156?auto=format&fit=crop&w=900&q=82"],
-      ["Markthalle Neun", "local-food", 58, 67, 36, "步行 14 分钟", "小吃摊和本地餐饮聚合，预算弹性好。", "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?auto=format&fit=crop&w=900&q=82"],
-      ["Klunkerkranich 天台", "night", 63, 75, 44, "地铁 26 分钟", "傍晚视野和音乐场景适合作为夜间收束点。", "https://images.unsplash.com/photo-1517457373958-b7bdd4587205?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Rome: {
-    label: "罗马，意大利",
-    visaDays: { CN: 18, SG: 0, US: 0, MY: 0 },
-    center: "Centro Storico - Trastevere - Monti",
-    areas: [
-      ["centro", "历史中心", 52, 43],
-      ["trastevere", "特拉斯提弗列", 43, 58],
-      ["monti", "蒙蒂", 61, 47],
-      ["prati", "普拉蒂 / 梵蒂冈", 35, 35]
-    ],
-    places: [
-      ["斗兽场", "history", 63, 51, 18, "步行 17 分钟", "古罗马主叙事的最高识别度锚点。", "https://images.unsplash.com/photo-1552832230-c0197dd311b5?auto=format&fit=crop&w=900&q=82"],
-      ["梵蒂冈博物馆", "museum", 31, 33, 34, "地铁 25 分钟", "艺术密度极高，适合作为半日核心。", "https://images.unsplash.com/photo-1531572753322-ad063cecc140?auto=format&fit=crop&w=900&q=82"],
-      ["Trastevere 小巷", "local-food", 43, 59, 48, "步行 16 分钟", "餐馆、小广场和夜色都适合团队汇合。", "https://images.unsplash.com/photo-1529260830199-42c24126f198?auto=format&fit=crop&w=900&q=82"],
-      ["万神殿周边", "architecture", 50, 42, 12, "步行 12 分钟", "建筑尺度和城市肌理适合低折返游览。", "https://images.unsplash.com/photo-1525874684015-58379d421a52?auto=format&fit=crop&w=900&q=82"],
-      ["Villa Borghese", "nature", 47, 25, 20, "公交 21 分钟", "用公园和美术馆缓冲高密度古迹行程。", "https://images.unsplash.com/photo-1515542622106-78bda8ba0e5b?auto=format&fit=crop&w=900&q=82"],
-      ["Monti 生活方式街区", "shopping", 60, 46, 58, "步行 14 分钟", "小店、古着和酒吧适合购物与夜间衔接。", "https://images.unsplash.com/photo-1523906834658-6e24ef2386f9?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Barcelona: {
-    label: "巴塞罗那，西班牙",
-    visaDays: { CN: 18, SG: 0, US: 0, MY: 0 },
-    center: "Eixample - Gothic Quarter - Barceloneta",
-    areas: [
-      ["eixample", "扩展区", 52, 42],
-      ["gothic", "哥特区", 48, 58],
-      ["gracia", "格拉西亚", 47, 28],
-      ["barceloneta", "巴塞罗那海滩", 63, 70]
-    ],
-    places: [
-      ["圣家堂", "architecture", 57, 36, 30, "地铁 16 分钟", "高迪建筑主锚点，视觉确定性极强。", "https://images.unsplash.com/photo-1583422409516-2895a77efded?auto=format&fit=crop&w=900&q=82"],
-      ["巴特罗之家", "architecture", 49, 42, 35, "步行 12 分钟", "立面、室内和城市步行线高度吻合。", "https://images.unsplash.com/photo-1539037116277-4db20889f2d4?auto=format&fit=crop&w=900&q=82"],
-      ["哥特区小巷", "history", 47, 58, 16, "步行 15 分钟", "老城肌理清晰，适合穿插咖啡和小店。", "https://images.unsplash.com/photo-1511527661048-7fe73d85e9a4?auto=format&fit=crop&w=900&q=82"],
-      ["博盖利亚市场", "local-food", 45, 57, 38, "步行 10 分钟", "本地小吃和市场动线适合作为午餐点。", "https://images.unsplash.com/photo-1543783207-ec64e4d95325?auto=format&fit=crop&w=900&q=82"],
-      ["巴塞罗那海滩", "nature", 64, 72, 24, "公交 22 分钟", "用海风降低老城和建筑日的疲劳。", "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=900&q=82"],
-      ["El Born 设计小店", "shopping", 53, 55, 54, "步行 14 分钟", "买手店、酒吧和画廊适合傍晚探索。", "https://images.unsplash.com/photo-1481437156560-3205f6a55735?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Oslo: {
-    label: "奥斯陆，挪威",
-    visaDays: { CN: 18, SG: 0, US: 0, MY: 0 },
-    center: "Sentrum - Bjørvika - Grünerløkka",
-    areas: [
-      ["sentrum", "市中心", 50, 48],
-      ["bjorvika", "Bjørvika 海湾", 61, 54],
-      ["grunerlokka", "Grünerløkka", 45, 34],
-      ["aker-brygge", "Aker Brygge", 39, 55]
-    ],
-    places: [
-      ["奥斯陆歌剧院", "architecture", 62, 55, 0, "步行 14 分钟", "可步行屋顶和峡湾视野适合作为第一站。", "https://images.unsplash.com/photo-1513519245088-0e12902e5a38?auto=format&fit=crop&w=900&q=82"],
-      ["Munch 美术馆", "museum", 64, 50, 18, "步行 12 分钟", "现代美术馆和海湾新区形成高效组合。", "https://images.unsplash.com/photo-1544531586-fde5298cdd40?auto=format&fit=crop&w=900&q=82"],
-      ["Aker Brygge 海港", "luxury", 38, 56, 72, "电车 16 分钟", "海景餐厅和码头步道适合舒适预算线。", "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=900&q=82"],
-      ["Grünerløkka 咖啡街", "slow-cafe", 45, 34, 34, "电车 18 分钟", "独立咖啡、唱片店和社区公园构成慢旅行片区。", "https://images.unsplash.com/photo-1501339847302-ac426a4a7cbb?auto=format&fit=crop&w=900&q=82"],
-      ["Vigeland 雕塑公园", "nature", 27, 42, 0, "电车 25 分钟", "开阔公园和雕塑群适合家庭友好节奏。", "https://images.unsplash.com/photo-1464822759023-fed622ff2c3b?auto=format&fit=crop&w=900&q=82"],
-      ["Bygdøy 博物馆半岛", "history", 25, 63, 24, "公交 28 分钟", "海事、民俗和半岛自然合并成半日线。", "https://images.unsplash.com/photo-1527004013197-933c4bb611b3?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  Helsinki: {
-    label: "赫尔辛基，芬兰",
-    visaDays: { CN: 18, SG: 0, US: 0, MY: 0 },
-    center: "Kluuvi - Design District - Katajanokka",
-    areas: [
-      ["kluuvi", "Kluuvi 市中心", 52, 46],
-      ["design", "设计区", 47, 58],
-      ["katajanokka", "Katajanokka", 65, 48],
-      ["kallio", "Kallio", 45, 30]
-    ],
-    places: [
-      ["赫尔辛基中央图书馆 Oodi", "architecture", 50, 43, 0, "步行 12 分钟", "公共建筑和城市生活方式高度融合。", "https://images.unsplash.com/photo-1524758631624-e2822e304c36?auto=format&fit=crop&w=900&q=82"],
-      ["阿黛浓美术馆", "museum", 53, 47, 22, "步行 10 分钟", "芬兰艺术入门点，适合文化密度控制。", "https://images.unsplash.com/photo-1564399579883-451a5d44ec08?auto=format&fit=crop&w=900&q=82"],
-      ["设计区小店线", "shopping", 47, 59, 62, "步行 16 分钟", "家居、陶瓷和服装店构成清晰买手路线。", "https://images.unsplash.com/photo-1441986300917-64674bd600d8?auto=format&fit=crop&w=900&q=82"],
-      ["老市场大厅", "local-food", 59, 56, 36, "电车 12 分钟", "海港边的本地食物和轻午餐选择稳定。", "https://images.unsplash.com/photo-1504674900247-0877df9cc836?auto=format&fit=crop&w=900&q=82"],
-      ["Kallio 咖啡酒吧区", "slow-cafe", 45, 30, 32, "电车 18 分钟", "社区感强，适合从白天咖啡过渡到夜间酒吧。", "https://images.unsplash.com/photo-1495474472287-4d71bcdd2085?auto=format&fit=crop&w=900&q=82"],
-      ["Suomenlinna 海堡", "history", 70, 72, 18, "渡轮 25 分钟", "世界遗产海岛线，适合天气好的慢半日。", "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  "New York City": {
-    label: "纽约，美国",
-    visaDays: { CN: 30, SG: 0, US: 0, MY: 21 },
-    center: "Lower Manhattan - Midtown - Brooklyn",
-    areas: [
-      ["midtown", "Midtown 曼哈顿", 54, 39],
-      ["soho", "SoHo / 下城", 49, 61],
-      ["williamsburg", "Williamsburg", 68, 58],
-      ["upper-west", "Upper West Side", 40, 27]
-    ],
-    places: [
-      ["MoMA 现代艺术博物馆", "museum", 54, 34, 30, "地铁 14 分钟", "现代艺术主锚点，适合高审美偏好用户。", "https://images.unsplash.com/photo-1485871981521-5b1fd3805eee?auto=format&fit=crop&w=900&q=82"],
-      ["高线公园", "nature", 43, 50, 0, "地铁 18 分钟", "线性公园能把建筑、街区和步行连接起来。", "https://images.unsplash.com/photo-1490644658840-3f2e3f8c5625?auto=format&fit=crop&w=900&q=82"],
-      ["SoHo 买手街", "shopping", 49, 62, 88, "步行 17 分钟", "品牌、画廊和咖啡店密度高，预算弹性大。", "https://images.unsplash.com/photo-1534270804882-6b5048b1c1fc?auto=format&fit=crop&w=900&q=82"],
-      ["Williamsburg 咖啡与唱片", "retro", 69, 58, 46, "地铁 24 分钟", "复古店、音乐和河岸视野适合小众半日线。", "https://images.unsplash.com/photo-1518005020951-eccb494ad742?auto=format&fit=crop&w=900&q=82"],
-      ["切尔西市场", "local-food", 44, 53, 48, "步行 12 分钟", "多人同行时非常稳妥的餐饮集合点。", "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?auto=format&fit=crop&w=900&q=82"],
-      ["布鲁克林大桥夜景", "night", 59, 67, 0, "地铁 20 分钟", "免费但记忆点强，适合作为夜间收束路线。", "https://images.unsplash.com/photo-1518391846015-55a9cc003b25?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  "Los Angeles": {
-    label: "洛杉矶，美国",
-    visaDays: { CN: 30, SG: 0, US: 0, MY: 21 },
-    center: "Santa Monica - Hollywood - Downtown LA",
-    areas: [
-      ["santa-monica", "Santa Monica", 25, 58],
-      ["hollywood", "Hollywood", 50, 39],
-      ["dtla", "Downtown LA", 68, 55],
-      ["silver-lake", "Silver Lake", 61, 43]
-    ],
-    places: [
-      ["盖蒂中心", "museum", 32, 34, 25, "驾车 24 分钟", "建筑、展览和城市视野同时命中。", "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=900&q=82"],
-      ["Griffith Observatory", "nature", 54, 30, 0, "驾车 25 分钟", "日落和城市夜景适合低成本高记忆点。", "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=900&q=82"],
-      ["Arts District 画廊街", "hidden", 70, 57, 42, "驾车 18 分钟", "壁画、咖啡和独立店适合发现模式。", "https://images.unsplash.com/photo-1494526585095-c41746248156?auto=format&fit=crop&w=900&q=82"],
-      ["Santa Monica Pier", "family", 23, 60, 38, "步行 16 分钟", "海边、游乐设施和餐饮对团队容错率高。", "https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=900&q=82"],
-      ["Silver Lake 咖啡线", "slow-cafe", 60, 43, 36, "驾车 16 分钟", "社区咖啡、唱片店和湖边散步节奏舒缓。", "https://images.unsplash.com/photo-1501339847302-ac426a4a7cbb?auto=format&fit=crop&w=900&q=82"],
-      ["Rodeo Drive", "luxury", 36, 48, 95, "驾车 22 分钟", "高端购物和餐厅适合作为奢华偏好分支。", "https://images.unsplash.com/photo-1441986300917-64674bd600d8?auto=format&fit=crop&w=900&q=82"]
-    ]
-  },
-  "San Francisco": {
-    label: "旧金山，美国",
-    visaDays: { CN: 30, SG: 0, US: 0, MY: 21 },
-    center: "Mission - Hayes Valley - Embarcadero",
-    areas: [
-      ["union-square", "Union Square", 52, 49],
-      ["mission", "Mission District", 48, 66],
-      ["hayes", "Hayes Valley", 42, 48],
-      ["embarcadero", "Embarcadero", 65, 48]
-    ],
-    places: [
-      ["SFMOMA", "museum", 55, 52, 30, "步行 14 分钟", "现代艺术和市中心路线衔接效率高。", "https://images.unsplash.com/photo-1501594907352-04cda38ebc29?auto=format&fit=crop&w=900&q=82"],
-      ["Ferry Building 市集", "local-food", 66, 49, 46, "电车 12 分钟", "海湾边市场适合早餐或午餐集合。", "https://images.unsplash.com/photo-1504674900247-0877df9cc836?auto=format&fit=crop&w=900&q=82"],
-      ["Mission 壁画街区", "hidden", 48, 67, 28, "地铁 18 分钟", "街头艺术、墨西哥餐和社区感适合深度线。", "https://images.unsplash.com/photo-1518005020951-eccb494ad742?auto=format&fit=crop&w=900&q=82"],
-      ["Golden Gate Park", "nature", 24, 46, 18, "公交 28 分钟", "公园、美术馆和植物园能组成低风险半日。", "https://images.unsplash.com/photo-1448375240586-882707db888b?auto=format&fit=crop&w=900&q=82"],
-      ["Hayes Valley 设计小店", "shopping", 42, 48, 58, "步行 15 分钟", "生活方式店和餐厅适合下午轻购物。", "https://images.unsplash.com/photo-1441986300917-64674bd600d8?auto=format&fit=crop&w=900&q=82"],
-      ["Twin Peaks 夜景", "night", 38, 62, 0, "驾车 20 分钟", "城市全景强，适合作为末段低成本记忆点。", "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=900&q=82"]
-    ]
-  }
-};
-
 const transportIcons = ["🚶", "🚌", "🚇", "🚕"];
 const algorithmWeights = {
   nominationScore: 0.45,
@@ -594,42 +508,56 @@ const algorithmWeights = {
 };
 const rankWeights = { 1: 100, 2: 67, 3: 33 };
 const maxTravelByMode = { TRANSIT: 50, DRIVING: 60 };
-const maxPerVibe = 2;
+const cityTransferMaxStops = {
+  train: 2,
+  flight: 1,
+  bus: 1
+};
 const minimumCandidatePool = 8;
 
-const travelers = [
-  { name: "Mia", role: "文化策展", budget: "$1.6k", vibes: ["museum", "architecture", "slow-cafe"], mustVisits: ["根津美术馆", "代官山 T-Site", "清澄白河咖啡街"], color: "#1c6b7a" },
-  { name: "Alex", role: "美食探索", budget: "$2.1k", vibes: ["local-food", "night", "hidden"], mustVisits: ["筑地场外市场", "新宿黄金街", "中目黑河岸"], color: "#d85d47" },
-  { name: "Jo", role: "低风险路线", budget: "$1.4k", vibes: ["family", "nature", "history"], mustVisits: ["中目黑河岸", "根津美术馆", "上野公园"], color: "#0f8f73" }
+function getMaxPerVibe(days) {
+  return Math.max(3, Math.ceil(days * 0.8));
+}
+
+function getDay1MaxStops(arrivalTime) {
+  if (!arrivalTime) return 3;
+  const [h, m] = arrivalTime.split(":").map(Number);
+  const arrivalMinutes = h * 60 + m + 150;
+  if (arrivalMinutes <= 14 * 60) return 2;
+  if (arrivalMinutes <= 18 * 60) return 1;
+  return 0;
+}
+
+const demoTravelers = [
+  { name: "Mia", role: "文化策展", budget: "$1.6k", vibes: ["museum", "architecture", "slow-cafe"], mustVisits: ["", "", ""], color: "#1c6b7a" },
+  { name: "Alex", role: "美食探索", budget: "$2.1k", vibes: ["local-food", "night", "hidden"], mustVisits: ["", "", ""], color: "#d85d47" },
+  { name: "Jo", role: "低风险路线", budget: "$1.4k", vibes: ["family", "nature", "history"], mustVisits: ["", "", ""], color: "#0f8f73" }
 ];
-const defaultMustVisits = {
-  Tokyo: [
-    ["根津美术馆", "代官山 T-Site", "清澄白河咖啡街"],
-    ["筑地场外市场", "新宿黄金街", "中目黑河岸"],
-    ["中目黑河岸", "根津美术馆", "上野公园"]
-  ],
-  Seoul: [
-    ["DDP 东大门设计广场", "北村韩屋村", "圣水洞咖啡仓库"],
-    ["广藏市场", "汉南洞买手街", "圣水洞咖啡仓库"],
-    ["北村韩屋村", "广藏市场", "汉江公园"]
-  ],
-  Bangkok: [
-    ["郑王庙河岸", "Talat Noi 老街", "暹罗设计中心"],
-    ["唐人街夜市", "湄南河日落船", "Talat Noi 老街"],
-    ["郑王庙河岸", "暹罗设计中心", "伦披尼公园"]
-  ],
-  Paris: [
-    ["玛黑区画廊线", "路易威登基金会", "圣日耳曼咖啡"],
-    ["圣旺跳蚤市场", "圣日耳曼咖啡", "蒙马特日落"],
-    ["蒙马特日落", "玛黑区画廊线", "卢森堡公园"]
-  ]
-};
+const travelers = [
+  { name: "Planner", role: "主规划人", budget: "$1.6k", vibes: ["museum", "architecture", "slow-cafe"], mustVisits: ["", "", ""], color: "#1c6b7a" }
+];
+
+function normalizeMustVisits(mustVisits = []) {
+  const list = Array.isArray(mustVisits) ? mustVisits.slice(0, 3) : [];
+  while (list.length < 3) list.push("");
+  return list;
+}
+
 const state = {
   latestTrip: null,
   activeIndex: 0,
   language: "zh",
+  countryCode: "JP",
+  nationalityCode: "CN",
   departureAirport: "UNKNOWN",
+  departureAirportName: "",
+  departureAirportCoords: null,
   flightDepartureTime: "14:00",
+  arrivalAirport: "UNKNOWN",
+  arrivalAirportName: "",
+  arrivalAirportCoords: null,
+  flightArrivalTime: "",
+  cityTransferModes: {},
   cities: ["Tokyo"]
 };
 let cityCentersCache = {};
@@ -648,15 +576,16 @@ const i18n = {
     hotelStars: "酒店星级",
     departureAirport: "出发机场",
     flightDepartureTime: "航班起飞时间（最后一天）",
+    arrivalAirport: "到达机场",
+    flightArrivalTime: "航班到达时间（第一天）",
+    cityTransfer: "换城交通",
     nationality: "主预订人国籍",
     departure: "出发日期",
     language: "语言",
+    guide: "使用指引",
     hotelAreas: "每日酒店 / 住宿区域",
     applyAll: "全部套用",
     travelerPrefs: "每位同行者的氛围和必去地点",
-    insight1: "跨国多人游用户手动协调数天",
-    insight2: "竞品基准分析",
-    insight3: "冷启动 4 周种子用户",
     generate: "合成团队行程",
     workspaceEyebrow: "多人行程优化",
     share: "邀请队友查看",
@@ -666,7 +595,14 @@ const i18n = {
     modes: "步行 / 公交 / 驾车",
     consensusRoute: "共识路线",
     reservePool: "备选地点池",
-    countryNames: { Japan: "日本", England: "英格兰", France: "法国", Germany: "德国", Spain: "西班牙", Italy: "意大利", Norway: "挪威", Finland: "芬兰", USA: "美国" },
+    countryNames: {
+      Japan: "日本", France: "法国", UK: "英国", USA: "美国", Germany: "德国", Italy: "意大利", Spain: "西班牙",
+      "South Korea": "韩国", Thailand: "泰国", Singapore: "新加坡", China: "中国", Australia: "澳大利亚", UAE: "阿联酋",
+      Netherlands: "荷兰", Portugal: "葡萄牙", Norway: "挪威", Finland: "芬兰", Switzerland: "瑞士", Austria: "奥地利",
+      Greece: "希腊", Turkey: "土耳其", Canada: "加拿大", Mexico: "墨西哥", Indonesia: "印度尼西亚", Vietnam: "越南",
+      Malaysia: "马来西亚", "New Zealand": "新西兰", "Czech Republic": "捷克", Hungary: "匈牙利", Ireland: "爱尔兰",
+      Denmark: "丹麦", Sweden: "瑞典", Belgium: "比利时", Croatia: "克罗地亚"
+    },
     nationalityNames: { CN: "中国大陆", SG: "新加坡", US: "美国", MY: "马来西亚" },
     vibeNames: {
       "slow-cafe": "慢咖啡", architecture: "建筑巡礼", night: "夜色微醺", nature: "自然松弛",
@@ -687,15 +623,16 @@ const i18n = {
     hotelStars: "Hotel star level",
     departureAirport: "Departure airport",
     flightDepartureTime: "Flight departure time (last day)",
+    arrivalAirport: "Arrival airport",
+    flightArrivalTime: "Flight arrival time (Day 1)",
+    cityTransfer: "City transfer",
     nationality: "Lead traveler nationality",
     departure: "Departure date",
     language: "Language",
+    guide: "Guide",
     hotelAreas: "Hotel / accommodation area by day",
     applyAll: "Apply all",
     travelerPrefs: "Vibes and must-visit places per traveler",
-    insight1: "International group travelers coordinate manually for days",
-    insight2: "Competitor benchmarks",
-    insight3: "Seed users in first 4 weeks",
     generate: "Generate group itinerary",
     workspaceEyebrow: "Group itinerary optimization",
     share: "Invite teammates",
@@ -705,7 +642,14 @@ const i18n = {
     modes: "Walk / Transit / Drive",
     consensusRoute: "Consensus route",
     reservePool: "Reserve candidate pool",
-    countryNames: { Japan: "Japan", England: "England", France: "France", Germany: "Germany", Spain: "Spain", Italy: "Italy", Norway: "Norway", Finland: "Finland", USA: "USA" },
+    countryNames: {
+      Japan: "Japan", France: "France", UK: "United Kingdom", USA: "United States", Germany: "Germany", Italy: "Italy", Spain: "Spain",
+      "South Korea": "South Korea", Thailand: "Thailand", Singapore: "Singapore", China: "China", Australia: "Australia", UAE: "United Arab Emirates",
+      Netherlands: "Netherlands", Portugal: "Portugal", Norway: "Norway", Finland: "Finland", Switzerland: "Switzerland", Austria: "Austria",
+      Greece: "Greece", Turkey: "Turkey", Canada: "Canada", Mexico: "Mexico", Indonesia: "Indonesia", Vietnam: "Vietnam",
+      Malaysia: "Malaysia", "New Zealand": "New Zealand", "Czech Republic": "Czech Republic", Hungary: "Hungary", Ireland: "Ireland",
+      Denmark: "Denmark", Sweden: "Sweden", Belgium: "Belgium", Croatia: "Croatia"
+    },
     nationalityNames: { CN: "Mainland China", SG: "Singapore", US: "United States", MY: "Malaysia" },
     vibeNames: {
       "slow-cafe": "Slow cafes", architecture: "Architecture", night: "Nightlife", nature: "Nature",
@@ -718,6 +662,7 @@ const i18n = {
 const form = document.querySelector("#trip-form");
 const travelerList = document.querySelector("#traveler-list");
 const countryInput = document.querySelector("#country");
+const countryTags = document.querySelector("#country-tags");
 const destinationInput = document.querySelector("#destination");
 const cityTags = document.querySelector("#city-tags");
 const cityAddSelect = document.querySelector("#city-add-select");
@@ -736,8 +681,13 @@ const hotelStarsInput = document.querySelector("#hotel-stars");
 const departureAirportInput = document.querySelector("#departure-airport");
 const flightDepTimeInput = document.querySelector("#flight-dep-time");
 const flightTimeLabelEl = document.querySelector("#flight-time-label");
+const arrivalAirportInput = document.querySelector("#arrival-airport");
+const flightArrivalTimeInput = document.querySelector("#flight-arrival-time");
+const arrivalTimeLabelEl = document.querySelector("#arrival-time-label");
 const languageInput = document.querySelector("#language");
+const guideButton = document.querySelector("#guide-button");
 const title = document.querySelector("#workspace-title");
+const itineraryDisclaimer = document.querySelector("#itinerary-disclaimer");
 const personaCopy = document.querySelector("#persona-copy");
 const alertStack = document.querySelector("#alert-stack");
 const budgetTotal = document.querySelector("#budget-total");
@@ -754,7 +704,9 @@ const reservePoolList = document.querySelector("#reserve-pool-list");
 const reservePoolCount = document.querySelector("#reserve-pool-count");
 const reservePoolTitle = document.querySelector("#reserve-pool-title");
 const regenerate = document.querySelector("#regenerate");
-const shareButton = document.querySelector("#share");
+const exportPdfButton = document.querySelector("#export-pdf");
+const pdfExport = document.querySelector("#pdf-export");
+let shareButton = null;
 const dialog = document.querySelector("#detail-dialog");
 const closeDialog = document.querySelector("#close-dialog");
 const detailImage = document.querySelector("#detail-image");
@@ -763,8 +715,187 @@ const detailTitle = document.querySelector("#detail-title");
 const detailBody = document.querySelector("#detail-body");
 const toast = document.querySelector("#toast");
 
+function getTripIdFromPath() {
+  const match = window.location.pathname.match(/^\/trip\/([^/]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function bindShareButtonEvents() {
+  shareButton = document.querySelector("#share");
+  if (!shareButton || shareButton.dataset.eventsBound === "true") return;
+  shareButton.dataset.eventsBound = "true";
+  shareButton.addEventListener("click", async () => {
+    try {
+      shareButton.disabled = true;
+      shareButton.textContent = state.language === "en" ? "Creating..." : "创建中...";
+      const existingTripId = window._activeTripId || activeInviteTrip?.id || sharedTripId;
+      if (existingTripId) {
+        showInviteModal(`${window.location.origin}/trip/${existingTripId}`, existingTripId);
+      } else {
+        await createInviteTrip();
+      }
+      showToast(state.language === "en" ? "Invite created" : "邀请已创建");
+    } catch (error) {
+      console.error(error);
+      showToast(state.language === "en" ? "Invite failed. Check Supabase config." : "邀请创建失败，请检查 Supabase 配置。");
+    } finally {
+      shareButton.disabled = false;
+      shareButton.textContent = t("share");
+    }
+  });
+}
+
+const guideSteps = [
+  {
+    key: "destination",
+    selector: '[data-guide-target="destination"]',
+    zh: { title: "目的地", description: "选择你们想去的目的地，可以添加多个城市" },
+    en: { title: "Destination", description: "Choose where your group wants to go. You can add multiple cities." }
+  },
+  {
+    key: "settings",
+    selector: '[data-guide-target="settings"]',
+    zh: { title: "行程设置", description: "设置天数、人数和每人预算范围" },
+    en: { title: "Trip settings", description: "Set days, traveler count, and the per-person budget range." }
+  },
+  {
+    key: "surprise",
+    selector: '[data-guide-target="surprise"]',
+    zh: { title: "发现模式", description: "开启「惊喜模式」后，系统会在你们的提名地点之外，自动推荐符合团队氛围的隐藏好去处，让行程更有惊喜感。关闭后只显示提名地点。" },
+    en: { title: "Surprise Mode", description: "With Surprise Mode ON, the system automatically recommends hidden gems that match your group's vibe, beyond your nominated places. Turn it OFF to only include nominated places." }
+  },
+  {
+    key: "preferences",
+    selector: '[data-guide-target="preferences"]',
+    zh: { title: "我的偏好", description: "选择你喜欢的氛围，填写最想去的地方" },
+    en: { title: "My preferences", description: "Pick your favorite vibes and enter the places you most want to visit." }
+  },
+  {
+    key: "invite",
+    selector: '[data-guide-target="invite"]',
+    zh: { title: "邀请队友", description: "生成邀请链接，让队友填写各自的偏好" },
+    en: { title: "Invite", description: "Create an invite link so teammates can add their own preferences." }
+  },
+  {
+    key: "auto-generate",
+    selector: ".itinerary-panel, #result",
+    zh: { title: "自动生成", description: "填写完成后，行程会自动合成。邀请队友后，所有人填写完毕，点击共享页面的「合成团队行程」即可生成。" },
+    en: { title: "Auto-generate", description: "The itinerary generates automatically after you fill in your preferences. When using the invite flow, click 'Generate Trip' on the shared page after everyone fills in." }
+  },
+  {
+    key: "reserve",
+    selector: '[data-guide-target="reserve"]',
+    zh: { title: "备选池", description: "行程生成后，可以在备选池点击 🤍 标记想去的地方，或点击「加入行程」手动加入某一天。" },
+    en: { title: "Reserve pool", description: "After the itinerary is generated, tap 🤍 to mark places you want to visit, or click 'Add to itinerary' to manually add a place to a specific day." }
+  },
+  {
+    key: "export-pdf",
+    selector: '[data-guide-target="export-pdf"]',
+    zh: { title: "导出 PDF", description: "行程生成后，点击「导出 PDF」按钮，可以将完整行程保存为 PDF 文件，方便离线查看或分享给队友。" },
+    en: { title: "Export PDF", description: "After the itinerary is generated, click 'Export PDF' to save the complete itinerary as a PDF file for offline viewing or sharing with teammates." }
+  }
+];
+
+function bindGuideEvents() {
+  guideButton?.addEventListener("click", () => startGuide());
+}
+
+function startGuide() {
+  endGuide();
+  guideState = {
+    index: 0,
+    overlay: document.createElement("div"),
+    spotlight: document.createElement("div"),
+    tooltip: document.createElement("div")
+  };
+  guideState.overlay.className = "guide-overlay";
+  guideState.spotlight.className = "guide-spotlight";
+  guideState.tooltip.className = "guide-tooltip";
+  document.body.append(guideState.overlay, guideState.spotlight, guideState.tooltip);
+  window.addEventListener("resize", positionGuide);
+  window.addEventListener("scroll", positionGuide, true);
+  renderGuideStep();
+}
+
+function endGuide() {
+  if (!guideState) return;
+  guideState.overlay.remove();
+  guideState.spotlight.remove();
+  guideState.tooltip.remove();
+  window.removeEventListener("resize", positionGuide);
+  window.removeEventListener("scroll", positionGuide, true);
+  guideState = null;
+}
+
+function renderGuideStep() {
+  if (!guideState) return;
+  const step = guideSteps[guideState.index];
+  const target = document.querySelector(step.selector) || document.body;
+  target.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
+  setTimeout(positionGuide, 260);
+
+  const lang = state.language === "en" ? "en" : "zh";
+  const copy = step[lang];
+  const isLast = guideState.index === guideSteps.length - 1;
+  guideState.tooltip.innerHTML = `
+    <div class="guide-step-count">${guideState.index + 1}/${guideSteps.length}</div>
+    <h3>${copy.title}</h3>
+    <p>${copy.description}</p>
+    <div class="guide-dots">
+      ${guideSteps.map((_, index) => `<span class="${index === guideState.index ? "active" : ""}"></span>`).join("")}
+    </div>
+    <div class="guide-actions">
+      <button class="text-button guide-skip" type="button">${lang === "en" ? "Skip" : "跳过"}</button>
+      <button class="primary-button guide-next" type="button">${isLast ? (lang === "en" ? "Get started" : "开始使用") : (lang === "en" ? "Next" : "下一步")}</button>
+    </div>
+  `;
+  guideState.tooltip.querySelector(".guide-skip")?.addEventListener("click", endGuide);
+  guideState.tooltip.querySelector(".guide-next")?.addEventListener("click", () => {
+    if (isLast) {
+      endGuide();
+      return;
+    }
+    guideState.index += 1;
+    renderGuideStep();
+  });
+}
+
+function positionGuide() {
+  if (!guideState) return;
+  const step = guideSteps[guideState.index];
+  const target = document.querySelector(step.selector) || document.body;
+  const rect = target.getBoundingClientRect();
+  const padding = 10;
+  const top = Math.max(10, rect.top - padding);
+  const left = Math.max(10, rect.left - padding);
+  const width = Math.min(window.innerWidth - left - 10, rect.width + padding * 2);
+  const height = Math.min(window.innerHeight - top - 10, rect.height + padding * 2);
+
+  Object.assign(guideState.spotlight.style, {
+    top: `${top}px`,
+    left: `${left}px`,
+    width: `${width}px`,
+    height: `${height}px`
+  });
+
+  const tooltipWidth = Math.min(340, window.innerWidth - 28);
+  let tooltipTop = top + height + 16;
+  if (tooltipTop + 230 > window.innerHeight) tooltipTop = Math.max(14, top - 230);
+  let tooltipLeft = left;
+  if (tooltipLeft + tooltipWidth > window.innerWidth - 14) {
+    tooltipLeft = window.innerWidth - tooltipWidth - 14;
+  }
+  Object.assign(guideState.tooltip.style, {
+    width: `${tooltipWidth}px`,
+    top: `${tooltipTop}px`,
+    left: `${Math.max(14, tooltipLeft)}px`
+  });
+}
+
 function init() {
   console.log("init() started");
+  bindShareButtonEvents();
+  bindGuideEvents();
   departureInput.valueAsDate = new Date(Date.now() + 1000 * 60 * 60 * 24 * 21);
   applyLanguage();
   renderCityOptions("Tokyo");
@@ -773,17 +904,30 @@ function init() {
   renderTravelers();
   console.log("travelerList element:", travelerList);
   bindTravelerListEvents();
-  restoreFromHash();
   updateFlightTimeVisibility();
   // 等 Google Maps JS 加载完再初始化地图
   if (window.google) {
     initGoogleMap();
+    initCountryAutocomplete();
+    initCityAutocomplete();
+    initAirportAutocomplete();
   } else {
     window.addEventListener("load", () => {
       initGoogleMap();
+      initCountryAutocomplete();
+      initCityAutocomplete();
+      initAirportAutocomplete();
     });
   }
+  const pathTripId = getTripIdFromPath();
+  console.log("pathTripId:", pathTripId);
+  if (pathTripId) {
+    loadSharedTrip(pathTripId).catch(console.error);
+    return;
+  }
+  restoreFromHash();
   generateTrip().catch(console.error);
+  restoreInviteTripFromQuery().catch(console.error);
 }
 
 function initGoogleMap() {
@@ -824,6 +968,7 @@ function bindTravelerListEvents() {
       const input = wrap.querySelector(".nomination-input");
       const travelerCard = wrap.closest("[data-traveler]");
       const travelerIdx = Number(travelerCard.dataset.traveler);
+      if (sharedTripId && travelers[travelerIdx]?.name !== currentSharedMemberName) return;
       const placeIdx = Number(wrap.dataset.placeIdx);
       const placeName = suggestionItem.dataset.placeName;
 
@@ -831,6 +976,7 @@ function bindTravelerListEvents() {
       travelers[travelerIdx].mustVisits[placeIdx] = placeName;
       wrap.querySelector(".nomination-suggestions")
         .style.display = "none";
+      scheduleSharedMemberSave();
       generateTrip().catch(console.error);
       return;
     }
@@ -839,6 +985,7 @@ function bindTravelerListEvents() {
     if (!vibeButton) return;
     const card = event.target.closest("[data-traveler]");
     const traveler = travelers[Number(card.dataset.traveler)];
+    if (sharedTripId && traveler?.name !== currentSharedMemberName) return;
     const vibe = vibeButton.dataset.vibe;
     if (traveler.vibes.includes(vibe)) {
       traveler.vibes = traveler.vibes.filter((item) => item !== vibe);
@@ -846,6 +993,7 @@ function bindTravelerListEvents() {
       traveler.vibes = [...traveler.vibes, vibe];
     }
     renderTravelers();
+    scheduleSharedMemberSave();
   });
 
   travelerList.addEventListener("input", (event) => {
@@ -855,8 +1003,11 @@ function bindTravelerListEvents() {
     const input = event.target.closest("[data-must-visit]");
     if (input) {
       const card = event.target.closest("[data-traveler]");
-      travelers[Number(card.dataset.traveler)]
+      const traveler = travelers[Number(card.dataset.traveler)];
+      if (sharedTripId && traveler?.name !== currentSharedMemberName) return;
+      traveler
         .mustVisits[Number(input.dataset.mustVisit)] = input.value;
+      scheduleSharedMemberSave();
     }
 
     // 提名搜索逻辑
@@ -889,6 +1040,9 @@ function bindTravelerListEvents() {
 function updateFlightTimeVisibility() {
   if (!flightTimeLabelEl) return;
   flightTimeLabelEl.style.display = departureAirportInput.value === "UNKNOWN" ? "none" : "";
+  if (arrivalTimeLabelEl && arrivalAirportInput) {
+    arrivalTimeLabelEl.style.display = arrivalAirportInput.value === "UNKNOWN" ? "none" : "";
+  }
 }
 
 function t(key) {
@@ -900,31 +1054,130 @@ function applyLanguage() {
   document.querySelectorAll("[data-i18n]").forEach((node) => {
     node.textContent = t(node.dataset.i18n);
   });
-  Object.entries(t("countryNames")).forEach(([value, label]) => {
-    const option = countryInput.querySelector(`option[value="${value}"]`);
-    if (option) option.textContent = label;
-  });
+  if (countryInput) countryInput.placeholder = state.language === "en" ? "Search country" : "搜索国家";
+  if (departureAirportInput) departureAirportInput.placeholder = state.language === "en" ? "Search airport..." : "搜索机场...";
+  if (arrivalAirportInput) arrivalAirportInput.placeholder = state.language === "en" ? "Search airport..." : "搜索机场...";
   Object.entries(t("nationalityNames")).forEach(([value, label]) => {
     const option = nationalityInput.querySelector(`option[value="${value}"]`);
     if (option) option.textContent = label;
   });
   languageInput.value = state.language;
+  renderCountryTag();
 }
 
 function renderCityOptions(selectedCity) {
-  const cities = countryCities[countryInput.value] || countryCities.Japan;
+  const presetCities = countryInput.value ? (countryCities[countryInput.value] || []) : [];
+  const cities = [...new Set([selectedCity, ...(state.cities || []), ...presetCities].filter(Boolean))];
   destinationInput.innerHTML = cities
     .map((city) => `<option value="${city}" ${city === selectedCity ? "selected" : ""}>${city}</option>`)
     .join("");
-  if (!cities.includes(destinationInput.value)) destinationInput.value = cities[0];
+  if (!cities.includes(destinationInput.value)) destinationInput.value = selectedCity || cities[0] || "";
+}
+
+const countryCodeByName = {
+  Japan: "JP",
+  France: "FR",
+  UK: "GB",
+  "United Kingdom": "GB",
+  USA: "US",
+  "United States": "US",
+  Germany: "DE",
+  Italy: "IT",
+  Spain: "ES",
+  "South Korea": "KR",
+  Thailand: "TH",
+  Singapore: "SG",
+  China: "CN",
+  Australia: "AU",
+  UAE: "AE",
+  "United Arab Emirates": "AE",
+  Netherlands: "NL",
+  Portugal: "PT",
+  Norway: "NO",
+  Finland: "FI",
+  Switzerland: "CH",
+  Austria: "AT",
+  Greece: "GR",
+  Turkey: "TR",
+  Canada: "CA",
+  Mexico: "MX",
+  Indonesia: "ID",
+  Vietnam: "VN",
+  Malaysia: "MY",
+  "New Zealand": "NZ",
+  "Czech Republic": "CZ",
+  Czechia: "CZ",
+  Hungary: "HU",
+  Ireland: "IE",
+  Denmark: "DK",
+  Sweden: "SE",
+  Belgium: "BE",
+  Croatia: "HR"
+};
+
+function normalizeCountryName(name = "") {
+  const clean = String(name || "").trim();
+  const aliases = {
+    "United States": "USA",
+    "United States of America": "USA",
+    "United Kingdom": "UK",
+    "South Korea": "South Korea",
+    "Republic of Korea": "South Korea",
+    "United Arab Emirates": "UAE",
+    Czechia: "Czech Republic"
+  };
+  return aliases[clean] || clean;
+}
+
+function renderCountryTag() {
+  if (!countryTags) return;
+  const country = countryInput.value.trim();
+  countryTags.innerHTML = country ? `
+    <div class="city-tag country-tag" data-country="${country}">
+      ${t("countryNames")[country] || country}
+      <button
+        class="city-tag-remove"
+        data-remove-country="true"
+        type="button">×</button>
+    </div>
+  ` : "";
+}
+
+function updateCityAutocompleteRestriction() {
+  if (!cityAutocomplete) return;
+  if (state.countryCode) {
+    cityAutocomplete.setComponentRestrictions({ country: state.countryCode.toLowerCase() });
+  } else {
+    cityAutocomplete.setComponentRestrictions({ country: [] });
+  }
+}
+
+function setCountrySelection(countryName, countryCode = "", options = {}) {
+  const country = normalizeCountryName(countryName || "");
+  if (!country) return;
+  countryInput.value = country;
+  state.countryCode = countryCode || countryCodeByName[country] || "";
+  renderCountryTag();
+  updateCityAutocompleteRestriction();
+  if (options.clearCities !== false) {
+    state.cities = [];
+    if (cityAddSelect) cityAddSelect.value = "";
+    cityCentersCache = {};
+    renderCityTags();
+    resetMustVisitsForDestination();
+    renderTravelers();
+    generateTrip().catch(console.error);
+  }
 }
 
 function renderCityTags() {
   if (!cityTags) return;
 
-  const countryOptions = countryCities[countryInput.value] || countryCities.Japan;
-  state.cities = state.cities.filter((city) => countryOptions.includes(city));
-  if (!state.cities.length) state.cities = [countryOptions[0] || "Tokyo"];
+  const fallbackCity = countryInput.value
+    ? (countryCities[countryInput.value]?.[0] || destinationInput.value || "Tokyo")
+    : "";
+  state.cities = [...new Set(state.cities.map((city) => String(city || "").trim()).filter(Boolean))];
+  if (!state.cities.length && fallbackCity) state.cities = [fallbackCity];
   if (destinationInput) {
     renderCityOptions(state.cities[0]);
     destinationInput.value = state.cities[0];
@@ -941,13 +1194,189 @@ function renderCityTags() {
   `).join("");
 
   if (cityAddSelect) {
-    const available = countryOptions.filter((city) => !state.cities.includes(city));
-    cityAddSelect.innerHTML = available
-      .map((city) => `<option value="${city}">${city}</option>`)
-      .join("");
+    cityAddSelect.value = "";
+    cityAddSelect.placeholder = state.language === "en" ? "Search any city" : "搜索任意城市";
   }
 
   renderAccommodationOptions();
+}
+
+function rebuildCitiesFromTags() {
+  const currentCities = cityTags
+    ? [...cityTags.querySelectorAll(".city-tag")]
+      .map((tag) => tag.dataset.city)
+      .filter(Boolean)
+    : [];
+  state.cities = currentCities.length ? currentCities : [destinationInput.value].filter(Boolean);
+  return state.cities;
+}
+
+function extractCityNameFromPlace(place) {
+  const components = place?.address_components || [];
+  const cityComponent = components.find((component) =>
+    component.types?.includes("locality") ||
+    component.types?.includes("postal_town") ||
+    component.types?.includes("administrative_area_level_2") ||
+    component.types?.includes("administrative_area_level_1")
+  );
+  return (cityComponent?.long_name || place?.name || cityAddSelect?.value || "").trim();
+}
+
+function extractCountryFromPlace(place) {
+  const component = place?.address_components?.find((item) => item.types?.includes("country"));
+  return {
+    name: normalizeCountryName(component?.long_name || place?.name || countryInput?.value || ""),
+    code: component?.short_name || ""
+  };
+}
+
+function slugify(text) {
+  return String(text || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\u4e00-\u9fa5]+/gi, "-")
+    .replace(/^-+|-+$/g, "") || "area";
+}
+
+function addCityTag(cityName) {
+  const city = String(cityName || "").trim();
+  if (!city || state.cities.includes(city)) return false;
+  state.cities.push(city);
+  delete cityCentersCache[city];
+  renderCityTags();
+  resetMustVisitsForDestination();
+  renderTravelers();
+  generateTrip().catch(console.error);
+  return true;
+}
+
+function initCityAutocomplete() {
+  if (!cityAddSelect || cityAutocomplete) return;
+  if (!window.google?.maps?.places) {
+    window.setTimeout(initCityAutocomplete, 600);
+    return;
+  }
+  cityAutocomplete = new google.maps.places.Autocomplete(cityAddSelect, {
+    types: ["(cities)"],
+    fields: ["address_components", "name", "formatted_address", "geometry"]
+  });
+  updateCityAutocompleteRestriction();
+  cityAutocomplete.addListener("place_changed", () => {
+    const city = extractCityNameFromPlace(cityAutocomplete.getPlace());
+    if (addCityTag(city)) cityAddSelect.value = "";
+  });
+}
+
+function initCountryAutocomplete() {
+  if (!countryInput || countryAutocomplete) return;
+  if (!window.google?.maps?.places) {
+    window.setTimeout(initCountryAutocomplete, 600);
+    return;
+  }
+  countryAutocomplete = new google.maps.places.Autocomplete(countryInput, {
+    types: ["country"],
+    fields: ["address_components", "name", "formatted_address", "geometry"]
+  });
+  countryAutocomplete.addListener("place_changed", () => {
+    const country = extractCountryFromPlace(countryAutocomplete.getPlace());
+    setCountrySelection(country.name, country.code);
+  });
+}
+
+function extractIataCode(text = "") {
+  const match = String(text).match(/\(([A-Z]{3})\)\s*$/) || String(text).match(/\b([A-Z]{3})\b/g)?.slice(-1)?.[0];
+  return Array.isArray(match) ? match[1] : match || "";
+}
+
+function formatAirportDisplay(name = "", code = "") {
+  const cleanName = String(name || "").replace(/\s*\([A-Z]{3}\)\s*$/, "").trim();
+  return code ? `${cleanName || code} (${code})` : cleanName;
+}
+
+function applyAirportSelection(kind, place) {
+  const input = kind === "departure" ? departureAirportInput : arrivalAirportInput;
+  if (!input) return;
+  const location = place?.geometry?.location;
+  const rawName = place?.name || place?.formatted_address || input.value || "";
+  const code = extractIataCode(rawName);
+  const display = formatAirportDisplay(rawName, code);
+  const key = code || display || "UNKNOWN";
+  const coords = location ? { lat: location.lat(), lng: location.lng(), x: 50, y: 50 } : null;
+
+  input.value = display;
+  input.dataset.airportCode = code;
+  input.dataset.lat = coords ? String(coords.lat) : "";
+  input.dataset.lng = coords ? String(coords.lng) : "";
+  if (coords) airportCoords[key] = coords;
+
+  if (kind === "departure") {
+    state.departureAirport = key;
+    state.departureAirportName = display;
+    state.departureAirportCoords = coords;
+  } else {
+    state.arrivalAirport = key;
+    state.arrivalAirportName = display;
+    state.arrivalAirportCoords = coords;
+  }
+  updateFlightTimeVisibility();
+  generateTrip().catch(console.error);
+}
+
+function clearAirportSelection(kind) {
+  const input = kind === "departure" ? departureAirportInput : arrivalAirportInput;
+  if (!input) return;
+  input.value = "";
+  input.dataset.airportCode = "";
+  input.dataset.lat = "";
+  input.dataset.lng = "";
+  if (kind === "departure") {
+    state.departureAirport = "UNKNOWN";
+    state.departureAirportName = "";
+    state.departureAirportCoords = null;
+  } else {
+    state.arrivalAirport = "UNKNOWN";
+    state.arrivalAirportName = "";
+    state.arrivalAirportCoords = null;
+  }
+  updateFlightTimeVisibility();
+}
+
+function updateAirportAutocompleteBias() {
+  if (arrivalAirportAutocomplete) {
+    const center = cityCentersCache[state.cities?.[0]];
+    if (center?.lat && center?.lng && window.google?.maps) {
+      const latLng = new google.maps.LatLng(center.lat, center.lng);
+      const circle = new google.maps.Circle({ center: latLng, radius: 200000 });
+      arrivalAirportAutocomplete.setBounds(circle.getBounds());
+      arrivalAirportAutocomplete.setOptions({ strictBounds: false });
+    }
+  }
+}
+
+function initAirportAutocomplete() {
+  if (!window.google?.maps?.places) {
+    window.setTimeout(initAirportAutocomplete, 600);
+    return;
+  }
+  if (departureAirportInput && !departureAirportAutocomplete) {
+    departureAirportAutocomplete = new google.maps.places.Autocomplete(departureAirportInput, {
+      types: ["airport"],
+      fields: ["address_components", "name", "formatted_address", "geometry"]
+    });
+    departureAirportAutocomplete.addListener("place_changed", () => {
+      applyAirportSelection("departure", departureAirportAutocomplete.getPlace());
+    });
+  }
+  if (arrivalAirportInput && !arrivalAirportAutocomplete) {
+    arrivalAirportAutocomplete = new google.maps.places.Autocomplete(arrivalAirportInput, {
+      types: ["airport"],
+      fields: ["address_components", "name", "formatted_address", "geometry"]
+    });
+    arrivalAirportAutocomplete.addListener("place_changed", () => {
+      applyAirportSelection("arrival", arrivalAirportAutocomplete.getPlace());
+    });
+  }
+  updateAirportAutocompleteBias();
 }
 
 function inferCountryForCity(city) {
@@ -960,11 +1389,16 @@ function vibeLabel(id) {
 
 function renderAccommodationOptions(savedAreas = []) {
   const days = Number(daysInput.value || 1);
-  hotelAreaList.innerHTML = Array.from({ length: days }, (_, index) => {
+  const nights = Math.max(0, days - 1);
+  hotelAreaAutocompletes.clear();
+  hotelAreaList.innerHTML = Array.from({ length: nights }, (_, index) => {
     const saved = savedAreas[index];
     let savedCity = saved?.city || state.cities[0] || "Tokyo";
     if (!state.cities.includes(savedCity)) savedCity = state.cities[0] || "Tokyo";
     const savedAreaId = saved?.areaId || saved?.id || (typeof saved === "string" ? saved : "");
+    const savedLabel = saved?.label || saved?.areaName || savedAreaId || `${savedCity} center`;
+    const savedLat = saved?.lat || "";
+    const savedLng = saved?.lng || "";
     const cityOptions = state.cities
       .map((city) => `
         <option value="${city}" ${city === savedCity ? "selected" : ""}>
@@ -972,14 +1406,11 @@ function renderAccommodationOptions(savedAreas = []) {
         </option>
       `)
       .join("");
-    const areas = getAreasForCity(savedCity);
-    const areaOptions = areas
-      .map(([id, label]) => `
-        <option value="${id}" ${id === savedAreaId ? "selected" : ""}>
-          ${label}
-        </option>
-      `)
-      .join("");
+    const previousSavedCity = index > 0
+      ? (savedAreas[index - 1]?.city || state.cities[0] || "Tokyo")
+      : savedCity;
+    const isCitySwitch = index > 0 && savedCity !== previousSavedCity;
+    const transferMode = saved?.transferMode || state.cityTransferModes[index] || "train";
     return `
       <div class="hotel-day-row" data-day-index="${index}">
         <span class="hotel-day-label"
@@ -989,9 +1420,24 @@ function renderAccommodationOptions(savedAreas = []) {
         <select class="hotel-city-select" data-hotel-day="${index}" data-type="city">
           ${cityOptions}
         </select>
-        <select class="hotel-area-select" data-hotel-day="${index}" data-type="area">
-          ${areaOptions}
-        </select>
+        <input
+          class="hotel-area-input"
+          data-hotel-day="${index}"
+          data-type="area"
+          data-area-id="${savedAreaId}"
+          data-lat="${savedLat}"
+          data-lng="${savedLng}"
+          value="${savedLabel}"
+          placeholder="${state.language === "en" ? "Search hotel area" : "搜索住宿区域"}"
+          autocomplete="off" />
+        <label class="city-transfer-control" data-transfer-day="${index}" style="${isCitySwitch ? "" : "display:none"}">
+          <span>${t("cityTransfer")}</span>
+          <select class="city-transfer-select" data-transfer-day="${index}">
+            <option value="train" ${transferMode === "train" ? "selected" : ""}>🚄 ${state.language === "en" ? "Train" : "火车"}</option>
+            <option value="flight" ${transferMode === "flight" ? "selected" : ""}>✈️ ${state.language === "en" ? "Flight" : "飞机"}</option>
+            <option value="bus" ${transferMode === "bus" ? "selected" : ""}>🚌 ${state.language === "en" ? "Bus" : "大巴"}</option>
+          </select>
+        </label>
       </div>
     `;
   })
@@ -1003,48 +1449,115 @@ function renderAccommodationOptions(savedAreas = []) {
       citySelect.addEventListener("change", () => {
         const dayIndex = Number(citySelect.dataset.hotelDay);
         const newCity = citySelect.value;
-        const areaSelect = hotelAreaList.querySelector(`.hotel-area-select[data-hotel-day="${dayIndex}"]`);
-        if (areaSelect) {
-          const areas = getAreasForCity(newCity);
-          areaSelect.innerHTML = areas
-            .map(([id, label]) => `<option value="${id}">${label}</option>`)
-            .join("");
+        const areaInput = hotelAreaList.querySelector(`.hotel-area-input[data-hotel-day="${dayIndex}"]`);
+        if (areaInput) {
+          areaInput.value = `${newCity} center`;
+          areaInput.dataset.areaId = "center";
+          areaInput.dataset.lat = "";
+          areaInput.dataset.lng = "";
+          initHotelAreaAutocomplete(areaInput);
+        }
+        updateCityTransferControls();
+        generateTrip().catch(console.error);
+      });
+    });
+  hotelAreaList
+    .querySelectorAll(".city-transfer-select")
+    .forEach((select) => {
+      select.addEventListener("change", () => {
+        state.cityTransferModes[Number(select.dataset.transferDay)] = select.value;
+        generateTrip().catch(console.error);
+      });
+    });
+  hotelAreaList
+    .querySelectorAll(".hotel-area-input")
+    .forEach((input) => {
+      initHotelAreaAutocomplete(input);
+      input.addEventListener("change", () => {
+        if (!input.value.trim()) {
+          input.dataset.areaId = "";
+          input.dataset.lat = "";
+          input.dataset.lng = "";
         }
         generateTrip().catch(console.error);
       });
     });
+  updateCityTransferControls();
+}
+
+function initHotelAreaAutocomplete(input) {
+  if (!input || hotelAreaAutocompletes.has(input)) return;
+  if (!window.google?.maps?.places) {
+    window.setTimeout(() => initHotelAreaAutocomplete(input), 600);
+    return;
+  }
+  const options = {
+    types: ["neighborhood", "sublocality", "locality"],
+    fields: ["address_components", "name", "formatted_address", "geometry"]
+  };
+  if (state.countryCode) options.componentRestrictions = { country: state.countryCode.toLowerCase() };
+  const autocomplete = new google.maps.places.Autocomplete(input, options);
+  autocomplete.addListener("place_changed", () => {
+    const place = autocomplete.getPlace();
+    const dayIndex = Number(input.dataset.hotelDay);
+    const citySelect = hotelAreaList.querySelector(`.hotel-city-select[data-hotel-day="${dayIndex}"]`);
+    const location = place?.geometry?.location;
+    input.value = place?.name || place?.formatted_address || input.value;
+    input.dataset.areaId = slugify(input.value || "hotel-area");
+    input.dataset.lat = location ? String(location.lat()) : "";
+    input.dataset.lng = location ? String(location.lng()) : "";
+    const city = extractCityNameFromPlace(place);
+    if (city && citySelect && state.cities.includes(city)) citySelect.value = city;
+    updateCityTransferControls();
+    generateTrip().catch(console.error);
+  });
+  hotelAreaAutocompletes.set(input, autocomplete);
+}
+
+function updateCityTransferControls() {
+  const citySelects = [...hotelAreaList.querySelectorAll(".hotel-city-select")];
+  hotelAreaList.querySelectorAll(".city-transfer-control").forEach((control) => {
+    const index = Number(control.dataset.transferDay);
+    const currentCity = citySelects[index]?.value;
+    const previousCity = citySelects[index - 1]?.value;
+    control.style.display = index > 0 && currentCity && previousCity && currentCity !== previousCity ? "" : "none";
+  });
 }
 
 function resetMustVisitsForDestination() {
-  const defaults = defaultMustVisits[destinationInput.value] || defaultMustVisits.Tokyo;
-  if (!defaults) return;
-  travelers.forEach((traveler, index) => {
-    traveler.mustVisits = [...defaults[index]];
+  travelers.forEach((traveler) => {
+    traveler.mustVisits = ["", "", ""];
   });
 }
 
 function renderTravelers() {
   travelerList.innerHTML = travelers
     .map((traveler, travelerIndex) => {
+      const mustVisits = normalizeMustVisits(traveler.mustVisits);
+      traveler.mustVisits = mustVisits;
+      const isSharedMode = Boolean(sharedTripId);
+      const isOwnCard = !isSharedMode || traveler.name === currentSharedMemberName;
+      const readonlyAttr = isOwnCard ? "" : "disabled";
+      const cardClass = isSharedMode && isOwnCard ? " is-own-member" : isSharedMode ? " is-readonly-member" : "";
       return `
-        <article class="traveler-card traveler-editor" data-traveler="${travelerIndex}">
+        <article class="traveler-card traveler-editor${cardClass}" data-traveler="${travelerIndex}">
           <div class="avatar" style="--avatar-color: ${traveler.color}">${traveler.name[0]}</div>
           <div>
             <div class="traveler-topline">
               <strong>${traveler.name}</strong>
-              <span>${traveler.role} · ${traveler.budget}</span>
+              <span>${traveler.role}</span>
             </div>
             <div class="mini-vibe-grid">
               ${vibeOptions.map(([id, label]) => `
-                <button class="mini-vibe ${traveler.vibes.includes(id) ? "is-selected" : ""}" type="button" data-vibe="${id}">
+                <button class="mini-vibe ${traveler.vibes.includes(id) ? "is-selected" : ""}" type="button" data-vibe="${id}" ${readonlyAttr}>
                   ${vibeLabel(id)}
                 </button>
               `).join("")}
             </div>
             <div class="must-visit-grid">
-              ${traveler.mustVisits.map((place, placeIndex) => `
+              ${mustVisits.map((place, placeIndex) => `
                 <label>
-                  ${state.language === "zh" ? "必去" : "Must visit"} ${placeIndex + 1}
+                  ${state.language === "zh" ? "想去" : "Want to visit"} ${placeIndex + 1}
                   <div class="nomination-wrap"
                        data-traveler-idx="${travelerIndex}"
                        data-place-idx="${placeIndex}">
@@ -1053,7 +1566,8 @@ function renderTravelers() {
                       data-must-visit="${placeIndex}"
                       value="${place}"
                       placeholder="Search a place..."
-                      autocomplete="off" />
+                      autocomplete="off"
+                      ${readonlyAttr} />
                     <ul class="nomination-suggestions"
                         style="display:none"></ul>
                   </div>
@@ -1068,7 +1582,10 @@ function renderTravelers() {
   console.log("renderTravelers HTML:", travelerList.innerHTML.slice(0, 500));
 }
 
-async function generateTrip() {
+async function generateTrip(travelerOverride = null) {
+  const activeTravelers = Array.isArray(travelerOverride) ? travelerOverride : travelers;
+  rebuildCitiesFromTags();
+  cityCentersCache = {};
   const destination = state.cities[0] || destinationInput.value;
   if (destinationInput) destinationInput.value = destination;
   const country = countryInput.value;
@@ -1077,14 +1594,19 @@ async function generateTrip() {
   const budgetMin = Number(budgetMinInput.value || Math.round(budgetMax * 0.72));
   const days = Number(daysInput.value || 5);
   const hotelStars = Number(hotelStarsInput.value || 3);
+  state.arrivalAirport = arrivalAirportInput?.value || state.arrivalAirport || "UNKNOWN";
+  state.flightArrivalTime = flightArrivalTimeInput?.value || state.flightArrivalTime || "";
   syncHotelAreaCount(days);
   const hotelAreas = getHotelAreas(plan, days);
+  state.cityTransferModes = Object.fromEntries(hotelAreas.map((hotel, index) => [index, hotel.transferMode || "train"]));
+  const day1MaxStops = getDay1MaxStops(state.flightArrivalTime);
   const discoveryMode = discoveryModeInput.value === "on";
   const transportMode = transportModeInput.value;
-  const groupVibes = [...new Set(travelers.flatMap((traveler) => traveler.vibes))];
+  const groupVibes = [...new Set(activeTravelers.flatMap((traveler) => traveler.vibes))];
 
   // 获取城市中心坐标
   let cityCenter = null;
+
   try {
     cityCenter = await getCityCenter(destination, country);
   } catch {}
@@ -1095,7 +1617,6 @@ async function generateTrip() {
   ])];
   console.log("hotelAreas cities:", hotelAreas.map((hotel) => ({ city: hotel.city, label: hotel.label })));
   console.log("uniqueCities:", uniqueCities);
-  cityCentersCache = {};
   await Promise.all(uniqueCities.map(async (city) => {
     try {
       const res = await fetch(
@@ -1109,11 +1630,19 @@ async function generateTrip() {
 
   const geocodedHotels = await Promise.all(
     hotelAreas.map(async (hotel) => {
+      if (hotel.lat && hotel.lng) return hotel;
       try {
+        const englishLabel = hotel.label.replace(/[^\x00-\x7F/]+/g, "").replace(/\/\s*/, "").trim();
+        const query = `${englishLabel || hotel.id || hotel.label} ${hotel.city} ${countryInput.value}`;
         const res = await fetch(
-          `/api/geocode?address=${encodeURIComponent(hotel.label + " " + hotel.city)}`
+          `/api/geocode?address=${encodeURIComponent(query)}`
         );
         const data = await res.json();
+        const address = (data.formattedAddress || "").toLowerCase();
+        const mismatchedCity = state.cities.some((city) =>
+          city !== hotel.city && address.includes((city || "").toLowerCase())
+        );
+        if (mismatchedCity) return hotel;
         if (data.lat) return { ...hotel, lat: data.lat, lng: data.lng };
       } catch {}
       return hotel;
@@ -1129,7 +1658,7 @@ async function generateTrip() {
           const center = cityCentersCache[city];
           if (!center) return [];
           const places = await fetchSystemPlaces(center, groupVibes, city);
-          return places.map((place) => ({ ...place, city }));
+          return places.map((place) => Array.isArray(place) ? [...place.slice(0, 10), city, ...place.slice(11)] : { ...place, city });
         } catch {
           return [];
         }
@@ -1146,8 +1675,8 @@ async function generateTrip() {
       : place
   );
   const enrichedPlan = apiSystemPlaces.length > 0
-    ? { ...plan, places: [...normalizedStaticPlaces, ...apiSystemPlaces] }
-    : { ...plan, places: normalizedStaticPlaces };
+    ? { ...plan, places: [...(discoveryMode ? [] : normalizedStaticPlaces), ...apiSystemPlaces.map((place, index) => normalizePlace(place, normalizedStaticPlaces.length + index, "system"))] }
+    : { ...plan, places: discoveryMode ? [] : normalizedStaticPlaces };
 
   const geocodedPlaces = await geocodePlaces(
     enrichedPlan.places,
@@ -1156,7 +1685,7 @@ async function generateTrip() {
 
   const nominationCityMap = {};
   await Promise.all(
-    travelers.flatMap((traveler) => traveler.mustVisits.filter(Boolean))
+    activeTravelers.flatMap((traveler) => traveler.mustVisits.filter(Boolean))
       .map(async (name) => {
         try {
           const res = await fetch(
@@ -1168,7 +1697,8 @@ async function generateTrip() {
           if (data.formattedAddress) {
             const addr = (data.formattedAddress || "").toLowerCase();
             for (const city of state.cities) {
-              if (addr.includes((city || "").toLowerCase())) {
+              const cityEn = (cityCentersCache[city]?.formattedAddress || city || "").toLowerCase().split(",")[0].trim();
+        if (addr.includes((city || "").toLowerCase()) || addr.includes(cityEn)) {
                 nominationCityMap[(name || "").toLowerCase()] = city;
                 nominationCityMap[normalizeForMatch(name)] = city;
                 break;
@@ -1187,9 +1717,9 @@ async function generateTrip() {
     places: geocodedPlaces
   };
 
-  const roadmap = generateRoadmap({
+  const roadmap = await generateRoadmap({
     plan: prePlan,
-    travelers,
+    travelers: activeTravelers,
     groupVibes,
     budgetMin,
     budgetMax,
@@ -1198,10 +1728,12 @@ async function generateTrip() {
     discoveryMode,
     transportMode,
     hotelStars,
-    nominationCityMap
+    nominationCityMap,
+    day1MaxStops,
+    geocodedPlaces
   });
 
-  state.latestTrip = { destination, country, cities: state.cities, plan: prePlan, hotelAreas: geocodedHotels, budgetMin, budgetMax, days, discoveryMode, transportMode, hotelStars, groupVibes, cityCenter, ...roadmap };
+  state.latestTrip = { destination, country, cities: state.cities, plan: prePlan, hotelAreas: geocodedHotels, budgetMin, budgetMax, days, discoveryMode, transportMode, hotelStars, groupVibes, cityCenter, arrivalAirport: state.arrivalAirport, flightArrivalTime: state.flightArrivalTime, cityTransferModes: state.cityTransferModes, day1MaxStops, ...roadmap };
   state.activeIndex = 0;
   if (state.latestTrip) {
     const geocodedCandidates = await geocodePlaces(
@@ -1234,76 +1766,111 @@ async function generateTrip() {
         )
       }));
   }
+  await persistGeneratedItinerary();
   renderTrip();
+  enrichTaxiLabels(state.latestTrip)
+    .then(() => {
+      if (state.latestTrip) {
+        renderTrip();
+        persistGeneratedItinerary().catch(console.error);
+      }
+    })
+    .catch(console.error);
 }
 
 function getActivePlan() {
-  return destinationPlans[destinationInput.value] || createGenericPlan(destinationInput.value, countryInput.value);
-}
-
-function createGenericPlan(city, country) {
-  const base = country === "France" ? destinationPlans.Paris : destinationPlans.Tokyo;
-  const label = `${city}, ${country}`;
+  const city = destinationInput.value || state.cities?.[0] || "";
+  const country = countryInput.value || "";
   return {
-    ...base,
-    label,
-    center: `${city} center - Old town - Local district`,
-    visaDays: base.visaDays,
-    areas: [
-      ["center", `${city} Center`, 50, 50],
-      ["station", `${city} Station Area`, 42, 58],
-      ["old-town", `${city} Old Town`, 58, 38],
-      ["waterfront", `${city} Waterfront`, 65, 62]
-    ],
-    places: base.places.map((place, index) => [
-      `${city} ${place[0]}`,
-      place[1],
-      clamp(place[2] + ((index % 3) - 1) * 6, 18, 82),
-      clamp(place[3] + ((index % 2) ? 7 : -5), 18, 82),
-      place[4],
-      place[5],
-      place[6],
-      place[7],
-      place[8],
-      place[9],
-      city
-    ])
+    label: `${city}, ${country}`,
+    center: `${city} center`,
+    visaDays: getVisaDays(country),
+    areas: [],
+    places: []
   };
 }
 
+function getVisaDays(country) {
+  const visaMap = {
+    France: 18, FR: 18,
+    Japan: 12, JP: 12,
+    UK: 15, GB: 15,
+    USA: 30, US: 30,
+    Germany: 18, DE: 18,
+    Italy: 18, IT: 18,
+    Australia: 20, AU: 20,
+    Thailand: 7, TH: 7,
+    Singapore: 5, SG: 5,
+    "South Korea": 10, KR: 10
+  };
+  return visaMap[country] || 14;
+}
+
 function syncHotelAreaCount(days) {
-  const current = Array.from({ length: Number(days || 1) }, (_, index) => {
+  const nights = Math.max(0, Number(days || 1) - 1);
+  const current = Array.from({ length: nights }, (_, index) => {
     const city = hotelAreaList.querySelector(`.hotel-city-select[data-hotel-day="${index}"]`)?.value;
-    const areaId = hotelAreaList.querySelector(`.hotel-area-select[data-hotel-day="${index}"]`)?.value;
-    return city || areaId ? { city, areaId } : null;
+    const areaInput = hotelAreaList.querySelector(`.hotel-area-input[data-hotel-day="${index}"]`);
+    const transferMode = hotelAreaList.querySelector(`.city-transfer-select[data-transfer-day="${index}"]`)?.value;
+    return city || areaInput?.value ? {
+      city,
+      id: areaInput?.dataset.areaId || slugify(areaInput?.value || city),
+      label: areaInput?.value || `${city} center`,
+      lat: Number(areaInput?.dataset.lat) || null,
+      lng: Number(areaInput?.dataset.lng) || null,
+      transferMode
+    } : null;
   }).filter(Boolean);
-  if (current.length !== days) renderAccommodationOptions(current);
+  if (current.length !== nights) renderAccommodationOptions(current);
 }
 
 function getHotelAreas(plan, days) {
   void plan;
   const citySelects = [...hotelAreaList.querySelectorAll(".hotel-city-select")];
-  const areaSelects = [...hotelAreaList.querySelectorAll(".hotel-area-select")];
-  return Array.from({ length: days }, (_, index) => {
+  const areaInputs = [...hotelAreaList.querySelectorAll(".hotel-area-input")];
+  const nights = Math.max(0, days - 1);
+  return Array.from({ length: nights }, (_, index) => {
     const city = citySelects[index]?.value || state.cities[0] || "Tokyo";
-    const areaId = areaSelects[index]?.value || "";
-    const areas = getAreasForCity(city);
-    const area = areas.find((item) => item[0] === areaId) || areas[0];
-    return { id: area[0], label: area[1], x: area[2], y: area[3], city };
-  });
+    const areaInput = areaInputs[index];
+    const label = areaInput?.value?.trim() || `${city} center`;
+    return {
+      id: areaInput?.dataset.areaId || slugify(label),
+      label,
+      x: 50,
+      y: 50,
+      lat: Number(areaInput?.dataset.lat) || null,
+      lng: Number(areaInput?.dataset.lng) || null,
+      city
+    };
+  }).map((hotel, index) => ({
+    ...hotel,
+    transferMode: index > 0
+      ? (hotelAreaList.querySelector(`.city-transfer-select[data-transfer-day="${index}"]`)?.value || state.cityTransferModes[index] || "train")
+      : ""
+  }));
 }
 
 async function geocodePlaces(places, cityCenter) {
   void cityCenter;
   return Promise.all(places.map(async (place) => {
-    if (place.lat && place.lng) return assignCityToPlace(place);
+    if (place.lat && place.lng) return assignCityToPlace({
+      ...place,
+      district: place.district || extractDistrictFromAddress(place.formattedAddress, state.cities)
+    });
     try {
       const res = await fetch(
         `/api/geocode?address=${encodeURIComponent(place.searchQuery || (place.name + " " + countryInput.value))}`
       );
       const data = await res.json();
       if (data.lat) {
-        return assignCityToPlace({ ...place, lat: data.lat, lng: data.lng, formattedAddress: data.formattedAddress || place.formattedAddress || "" });
+        const formattedAddress = data.formattedAddress || place.formattedAddress || "";
+        return assignCityToPlace({
+          ...place,
+          lat: data.lat,
+          lng: data.lng,
+          formattedAddress,
+          district: extractDistrictFromAddress(formattedAddress, state.cities)
+        });
       }
     } catch {}
     return place;
@@ -1314,19 +1881,24 @@ async function assignCityToPlace(place) {
   if (!place.lat || !place.lng) return place;
 
   const cities = state.cities || ["Tokyo"];
+  const district = place.district || extractDistrictFromAddress(place.formattedAddress, cities);
   if (cities.length === 1) {
-    return { ...place, city: cities[0] };
+    return { ...place, city: cities[0], district };
   }
 
   if (place.formattedAddress) {
     const addr = (place.formattedAddress || "").toLowerCase();
     for (const city of cities) {
-      if (addr.includes((city || "").toLowerCase())) {
+      const cityEn = (cityCentersCache[city]?.formattedAddress || city || "").toLowerCase().split(",")[0].trim();
+        if (addr.includes((city || "").toLowerCase()) || addr.includes(cityEn)) {
         console.log("assignCity by address:", place.name, "→", city);
-        return { ...place, city };
+        return { ...place, city, district };
       }
     }
   }
+
+  if (place.city) return { ...place, district };
+
 
   try {
     const res = await fetch(
@@ -1336,14 +1908,16 @@ async function assignCityToPlace(place) {
     if (data.formattedAddress) {
       const addr = (data.formattedAddress || "").toLowerCase();
       for (const city of cities) {
-        if (addr.includes((city || "").toLowerCase())) {
+        const cityEn = (cityCentersCache[city]?.formattedAddress || city || "").toLowerCase().split(",")[0].trim();
+        if (addr.includes((city || "").toLowerCase()) || addr.includes(cityEn)) {
           console.log("assignCity by geocode:", place.name, "→", city, "address:", data.formattedAddress);
           return {
             ...place,
             city,
             lat: data.lat || place.lat,
             lng: data.lng || place.lng,
-            formattedAddress: data.formattedAddress
+            formattedAddress: data.formattedAddress,
+            district: extractDistrictFromAddress(data.formattedAddress, cities)
           };
         }
       }
@@ -1365,7 +1939,30 @@ async function assignCityToPlace(place) {
   });
 
   console.log("assignCity by distance:", place.name, "→", nearestCity);
-  return { ...place, city: nearestCity };
+  return { ...place, city: nearestCity, district };
+}
+
+function extractDistrictFromAddress(formattedAddress = "", cities = []) {
+  const parts = String(formattedAddress)
+    .split(",")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (!parts.length) return "";
+
+  const cityNames = new Set((cities || []).map((city) => (city || "").toLowerCase()));
+  const countryNames = new Set(Object.keys(countryCities).map((country) => country.toLowerCase()));
+  const candidate = parts.find((part) => {
+    const lower = part.toLowerCase();
+    if (cityNames.has(lower) || countryNames.has(lower)) return false;
+    if (/^\d{3,}[-\d\s]*/.test(lower)) return false;
+    if (lower.includes("japan") || lower.includes("united states") || lower.includes("france")) return false;
+    return true;
+  }) || parts[0];
+
+  return candidate
+    .replace(/^\d+\s*/, "")
+    .replace(/^\d+[-\s]chome[-\s]*/i, "")
+    .trim();
 }
 
 async function enrichPlacePhotos(places) {
@@ -1385,32 +1982,41 @@ async function enrichPlacePhotos(places) {
       const data = await res.json();
       const match = data.places?.[0];
       const photoName = match?.photos?.[0]?.name;
+      const editorialSummary = match?.editorialSummary?.text || place.editorialSummary || "";
 
       if (photoName) {
         return {
           ...place,
-          image: `/api/photo?name=${encodeURIComponent(photoName)}`
+          image: `/api/photo?name=${encodeURIComponent(photoName)}`,
+          editorialSummary
         };
       }
+      if (editorialSummary) return { ...place, editorialSummary };
     } catch {}
     return place;
   }));
 }
 
-function generateRoadmap({ plan, travelers, groupVibes, budgetMin, budgetMax, days, hotelAreas, discoveryMode, transportMode, hotelStars, nominationCityMap = {} }) {
+async function generateRoadmap({ plan, travelers, groupVibes, budgetMin, budgetMax, days, hotelAreas, discoveryMode, transportMode, hotelStars, nominationCityMap = {}, day1MaxStops = 3, geocodedPlaces = [] }) {
   const travelerCount = Number(travelerCountInput?.value || 4);
   const roomsNeeded = Math.ceil(travelerCount / 2);
-  const hotelCostPerNight = (hotelCostUSD[hotelStars] || hotelCostUSD[3]) * roomsNeeded;
+  const country = countryInput.value;
+  const hotelRates = hotelCostByCountry[country] || hotelCostByCountry.default;
+  const hotelCostPerNight = (hotelRates[hotelStars] || hotelRates[3]) * roomsNeeded;
   const hotelCostPerPersonPerNight = Math.round(hotelCostPerNight / travelerCount);
   const totalBudgetCap = budgetMax;
-  const hotelTotalCost = hotelCostPerPersonPerNight * days;
+  const hotelTotalCost = hotelCostPerPersonPerNight * Math.max(0, days - 1);
   const activityBudgetCap = Math.max(0, totalBudgetCap - hotelTotalCost);
   const activityBudgetPerDay = Math.round(activityBudgetCap / Math.max(1, days));
   const activityBudgetTotal = activityBudgetCap;
   const BUDGET_FLEX = 1.15;
   const hardCap = activityBudgetCap * BUDGET_FLEX;
   const targetCount = Math.min(15, Math.max(days * 2, days * 3));
-  const systemPlaces = plan.places.map((place, index) => normalizePlace(place, index, "system"));
+  const planCity = plan.city || (state.cities && state.cities[0]) || "";
+  const systemPlaces = discoveryMode ? geocodedPlaces.filter(p => p.source === "system") : plan.places.map((place, index) => {
+    const p = normalizePlace(place, index, "system");
+    return p.city ? p : { ...p, city: planCity };
+  });
   const nominatedPlaces = buildNominatedCandidates(travelers, systemPlaces, hotelAreas[0], hotelAreas);
   const nominatedWithCity = nominatedPlaces.map((place) => {
     const nameKey = normalizeForMatch(place.name);
@@ -1432,8 +2038,9 @@ function generateRoadmap({ plan, travelers, groupVibes, budgetMin, budgetMax, da
       ? { ...place, city: matched.city }
       : place;
   });
-  const candidates = poolWithCity.map((place) => scoreCandidate(place, travelers, groupVibes, activityBudgetPerDay, hotelAreas));
-  const shortList = diversifyCandidates(candidates, targetCount, discoveryMode);
+  const geocodedPool = await geocodePlaces(poolWithCity, null);
+  const candidates = geocodedPool.map((place) => scoreCandidate(place, travelers, groupVibes, activityBudgetPerDay, hotelAreas));
+  const shortList = diversifyCandidates(candidates, targetCount, discoveryMode, days);
   const shortListKeys = new Set(shortList.map((place) => place.id));
   const budgetReservePool = candidates
     .filter((place) => !shortListKeys.has(place.id))
@@ -1444,12 +2051,12 @@ function generateRoadmap({ plan, travelers, groupVibes, budgetMin, budgetMax, da
   const reservePool = candidates
     .filter((place) => !keptKeys.has(place.id) && !removedKeys.has(place.id) && !shortListKeys.has(place.id))
     .sort((a, b) => b.score - a.score);
-  const clusteredDays = rebalanceDayClusters(clusterDays(budgetResult.kept, hotelAreas, transportMode), days, reservePool, hotelAreas, transportMode);
-  const itineraryDays = buildDayRoutes(clusteredDays, hotelAreas, transportMode);
+  const clusteredDays = rebalanceDayClusters(clusterDays(budgetResult.kept, hotelAreas, days, transportMode, day1MaxStops), days, reservePool, hotelAreas, transportMode, candidates);
+  const itineraryDays = await buildDayRoutes(clusteredDays, hotelAreas, transportMode, reservePool, candidates);
   const orderedPlaces = itineraryDays.flatMap((day) => day.places);
   const legs = itineraryDays.flatMap((day) => day.legs);
   const routeCost = itineraryDays.reduce((sum, day) => sum + day.routeCost, 0);
-  const hotelCost = hotelCostPerPersonPerNight * days;
+  const hotelCost = hotelCostPerPersonPerNight * Math.max(0, days - 1);
   const activityCost = orderedPlaces.reduce((sum, place) => sum + place.cost, 0) + days * 115 + routeCost;
   const total = activityCost + hotelCost;
   const averageScore = Math.round(orderedPlaces.reduce((sum, place) => sum + place.score, 0) / orderedPlaces.length);
@@ -1469,7 +2076,7 @@ function generateRoadmap({ plan, travelers, groupVibes, budgetMin, budgetMax, da
       systemCount: orderedPlaces.filter((place) => place.source === "system").length,
       discoveryMode,
       transportMode,
-      maxTravelMin: maxTravelByMode[transportMode],
+      maxTravelMin: getDynamicMaxTravel(transportMode, candidates),
       selectedCount: orderedPlaces.length,
       averageScore,
       budgetAction: formatBudgetAction(total, budgetMin, totalBudgetCap),
@@ -1486,6 +2093,10 @@ function normalizePlace(place, index, source = "system") {
       id: place.id || `${source}-${normalizeText(place.name)}`,
       index: place.index ?? index,
       source: place.source || source,
+      district: place.district || extractDistrictFromAddress(place.formattedAddress, state.cities),
+      editorialSummary: place.editorialSummary || "",
+      googlePlaceId: place.googlePlaceId || place.placeId || "",
+      userRatingCount: place.userRatingCount || 0,
       nominations: place.nominations || []
     };
   }
@@ -1499,10 +2110,14 @@ function normalizePlace(place, index, source = "system") {
     defaultRoute: place[5],
     description: place[6],
     formattedAddress: place[6] || "",
+    district: extractDistrictFromAddress(place[6] || "", state.cities),
     image: place[7],
     lat: place[8] || null,
     lng: place[9] || null,
     city: place[10] || place.city || "",
+    editorialSummary: place[11] || "",
+    googlePlaceId: place[12] || "",
+    userRatingCount: place[13] || 0,
     index,
     source,
     nominations: []
@@ -1580,10 +2195,10 @@ function scoreCandidate(place, travelers, groupVibes, budgetMax, hotelAreas = []
   const candidateHotels = hotelAreas.filter((hotel) => !place.city || !hotel.city || hotel.city === place.city);
   const referenceHotels = candidateHotels.length ? candidateHotels : hotelAreas;
   const referenceHotel = referenceHotels
-    .map((hotel) => ({ hotel, dist: distance(place, hotel) }))
+    .map((hotel) => ({ hotel, dist: travelTimeBetween(hotel, place, "TRANSIT") }))
     .sort((a, b) => a.dist - b.dist)[0]?.hotel;
-  const routeDistance = referenceHotel ? distance(place, referenceHotel) : 0;
-  const routeEfficiency = Math.max(0, 100 - routeDistance * 1.6);
+  const routeMinutes = referenceHotel ? travelTimeBetween(referenceHotel, place, "TRANSIT") : 0;
+  const routeEfficiency = Math.max(0, 100 - routeMinutes * 1.6);
   const score = Math.round(
     nominationScore * algorithmWeights.nominationScore +
     groupConsensus * algorithmWeights.groupConsensus +
@@ -1617,24 +2232,42 @@ function buildRationale(nominations, supporters, budgetFit) {
   return reasons.join(" · ");
 }
 
-function diversifyCandidates(candidates, count, discoveryMode) {
+function diversifyCandidates(candidates, count, discoveryMode, days) {
   const sorted = [...candidates].sort((a, b) => b.score - a.score || a.cost - b.cost);
-  const chosen = [];
-  const vibeCountsByCity = new Map();
-  const nominated = sorted.filter((candidate) => candidate.source === "nominated");
-  const system = sorted.filter((candidate) => candidate.source !== "nominated");
+  const maxPerVibe = getMaxPerVibe(days);
+  const buckets = new Map();
 
-  for (const candidate of [...nominated, ...system]) {
+  for (const candidate of sorted) {
     const cityVibeKey = `${candidate.city || "unknown"}:${candidate.vibe}`;
-    const currentCount = vibeCountsByCity.get(cityVibeKey) || 0;
-    if (currentCount < maxPerVibe) {
-      chosen.push(candidate);
-      vibeCountsByCity.set(cityVibeKey, currentCount + 1);
-    }
-    if (chosen.length >= count) break;
+    if (!buckets.has(cityVibeKey)) buckets.set(cityVibeKey, []);
+    buckets.get(cityVibeKey).push(candidate);
   }
 
-  return chosen;
+  const vibeCapped = [...buckets.values()]
+    .flatMap((bucket) => {
+      const nominated = bucket
+        .filter((candidate) => candidate.source === "nominated")
+        .sort((a, b) => b.score - a.score || a.cost - b.cost);
+      const system = bucket
+        .filter((candidate) => candidate.source !== "nominated")
+        .sort((a, b) => b.score - a.score || a.cost - b.cost);
+      const chosenNominated = nominated.slice(0, maxPerVibe);
+      return [
+        ...chosenNominated,
+        ...system.slice(0, Math.max(0, maxPerVibe - chosenNominated.length))
+      ];
+    })
+    .sort((a, b) => b.score - a.score || a.cost - b.cost)
+    .slice(0, count);
+  if (vibeCapped.length >= count) return vibeCapped;
+
+  const selectedIds = new Set(vibeCapped.map((candidate) => candidate.id));
+  const fillUp = sorted
+    .filter((candidate) => !selectedIds.has(candidate.id))
+    .slice(0, count - vibeCapped.length);
+  return [...vibeCapped, ...fillUp]
+    .sort((a, b) => b.score - a.score || a.cost - b.cost)
+    .slice(0, count);
 }
 
 function repairBudget(candidates, targetCount, budgetMax, days, transportMode = "TRANSIT", reservePool = []) {
@@ -1673,16 +2306,37 @@ function repairBudget(candidates, targetCount, budgetMax, days, transportMode = 
   return { kept: repaired, removed };
 }
 
-function clusterDays(places, hotelAreas, transportMode = "TRANSIT") {
-  void transportMode;
+function clusterDays(places, hotelAreas, days, transportMode = "TRANSIT", day1MaxStops = 3) {
   console.log("clusterDays places with city:", places.map((place) => ({ name: place.name, city: place.city })));
-  const k = hotelAreas.length;
+  const k = days;
   const clusters = Array.from({ length: k }, () => []);
   const dayIndicesByCity = new Map();
-  const flightDayIndex = state.flightDepartureTime ? k - 1 : null;
+  const flightDayIndex = state.flightDepartureTime ? days - 1 : null;
+  const maxStopsPerDay = 3;
+  const fillThreshold = getDynamicMaxTravel(transportMode, places);
+  const getDayHotel = (index) => hotelAreas[index] || hotelAreas[index - 1] || hotelAreas[0];
+  const isCitySwitchDay = (index) => index > 0 &&
+    getDayHotel(index)?.city &&
+    getDayHotel(index - 1)?.city &&
+    getDayHotel(index).city !== getDayHotel(index - 1).city;
+  const getDayStopCap = (index) => {
+    if (index === 0) return day1MaxStops;
+    if (isCitySwitchDay(index)) {
+      const mode = getDayHotel(index)?.transferMode || state.cityTransferModes[index] || "train";
+      return cityTransferMaxStops[mode] || 2;
+    }
+    return maxStopsPerDay;
+  };
+  const placeToHotelDistance = (place, hotel) =>
+    (place.lat && place.lng && hotel?.lat && hotel?.lng)
+      ? Math.hypot(place.lat - hotel.lat, place.lng - hotel.lng)
+      : distance(place, hotel || { x: 50, y: 50 });
 
-  hotelAreas.forEach((hotel, index) => {
+  Array.from({ length: k }, (_, index) => {
     if (index === flightDayIndex) return;
+    if (getDayStopCap(index) <= 0) return;
+    const hotel = getDayHotel(index);
+    if (!hotel) return;
     const city = hotel.city || "unknown";
     if (!dayIndicesByCity.has(city)) dayIndicesByCity.set(city, []);
     dayIndicesByCity.get(city).push(index);
@@ -1692,12 +2346,47 @@ function clusterDays(places, hotelAreas, transportMode = "TRANSIT") {
   places.forEach((place) => {
     const city = place.city && dayIndicesByCity.has(place.city)
       ? place.city
-      : hotelAreas
-        .map((hotel, index) => ({ index, city: hotel.city, dist: distance(place, hotel) }))
-        .sort((a, b) => a.dist - b.dist)[0]?.city || "unknown";
+      : "";
+    if (!city) return;
     if (!placesByCity.has(city)) placesByCity.set(city, []);
     placesByCity.get(city).push(place);
   });
+
+  const assignRoundRobinByCity = (cityPlaces, dayIndices) => {
+    const assignOnePass = (sourcePlaces) => {
+      const unassignedCityPlaces = sourcePlaces
+      .slice()
+      .sort((a, b) => b.score - a.score);
+      let assignedThisRound = true;
+
+      while (assignedThisRound) {
+        assignedThisRound = false;
+        const availableDays = dayIndices
+          .filter((index) => index !== flightDayIndex && clusters[index].length < getDayStopCap(index))
+          .sort((a, b) => clusters[a].length - clusters[b].length || a - b);
+
+        for (const dayIndex of availableDays) {
+          if (clusters[dayIndex].length >= getDayStopCap(dayIndex)) continue;
+          const dayHotel = getDayHotel(dayIndex);
+          const dayCity = dayHotel?.city || "";
+          if (!dayHotel || !dayCity) continue;
+          const candidateIndex = unassignedCityPlaces.findIndex((place) =>
+            place.city === dayCity &&
+            travelTimeBetween(dayHotel, place, transportMode) <= fillThreshold
+          );
+          if (candidateIndex === -1) continue;
+          const [candidate] = unassignedCityPlaces.splice(candidateIndex, 1);
+          clusters[dayIndex].push(candidate);
+          assignedThisRound = true;
+        }
+      }
+    };
+
+    const nominatedPlaces = cityPlaces.filter((place) => (place.nominations || []).length > 0);
+    const systemPlaces = cityPlaces.filter((place) => !(place.nominations || []).length);
+    assignOnePass(nominatedPlaces);
+    assignOnePass(systemPlaces);
+  };
 
   placesByCity.forEach((cityPlaces, city) => {
     const dayIndices = dayIndicesByCity.get(city) || [];
@@ -1705,25 +2394,9 @@ function clusterDays(places, hotelAreas, transportMode = "TRANSIT") {
 
     const sortedPlaces = cityPlaces
       .slice()
-      .sort((a, b) => b.score - a.score || distance(a, hotelAreas[dayIndices[0]]) - distance(b, hotelAreas[dayIndices[0]]));
-    const nominatedPlaces = sortedPlaces.filter((place) => (place.nominations || []).length > 0);
-    const remainingPlaces = sortedPlaces.filter((place) => !(place.nominations || []).length);
+      .sort((a, b) => b.score - a.score);
 
-    nominatedPlaces.forEach((place, placeIndex) => {
-      const dayIndex = dayIndices[placeIndex % dayIndices.length];
-      clusters[dayIndex].push(place);
-    });
-
-    remainingPlaces.forEach((place) => {
-      const dayIndex = dayIndices
-        .map((index) => ({
-          index,
-          load: clusters[index].length,
-          dist: distance(place, hotelAreas[index])
-        }))
-        .sort((a, b) => a.load - b.load || a.dist - b.dist)[0].index;
-      clusters[dayIndex].push(place);
-    });
+    assignRoundRobinByCity(sortedPlaces, dayIndices);
   });
 
   const unassigned = [];
@@ -1741,11 +2414,13 @@ function clusterDays(places, hotelAreas, transportMode = "TRANSIT") {
 
   clusters.forEach((cluster, index) => {
     if (index === flightDayIndex || cluster.length) return;
-    const dayCity = hotelAreas[index]?.city || "";
+    if (getDayStopCap(index) <= 0) return;
+    const dayHotel = getDayHotel(index);
+    const dayCity = dayHotel?.city || "";
     const sameCityCandidates = unassigned
       .map((place, reserveIndex) => ({ place, reserveIndex }))
       .filter(({ place }) => {
-        if (place.city && dayCity) return place.city === dayCity;
+        if (dayCity) return place.city === dayCity;
         return true;
       });
     const nominatedCandidate = sameCityCandidates
@@ -1761,32 +2436,71 @@ function clusterDays(places, hotelAreas, transportMode = "TRANSIT") {
     assignedIds.add(candidate.id);
   });
 
+  clusters.forEach((cluster, index) => {
+    if (index === flightDayIndex) return;
+    const stopCap = getDayStopCap(index);
+    if (stopCap <= 0) return;
+    const dayHotel = getDayHotel(index);
+    const dayCity = dayHotel?.city || "";
+    if (!dayHotel || !dayCity) return;
+
+    while (cluster.length < Math.min(2, stopCap)) {
+      const candidateIndex = unassigned
+        .map((place, reserveIndex) => ({
+          place,
+          reserveIndex,
+          minutes: travelTimeBetween(dayHotel, place, transportMode)
+        }))
+        .filter(({ place, minutes }) =>
+          place.city === dayCity &&
+          minutes <= fillThreshold &&
+          !assignedIds.has(place.id)
+        )
+        .sort((a, b) => b.place.score - a.place.score || a.minutes - b.minutes)[0]?.reserveIndex;
+
+      if (candidateIndex === undefined) break;
+      const [candidate] = unassigned.splice(candidateIndex, 1);
+      cluster.push(candidate);
+      assignedIds.add(candidate.id);
+    }
+  });
+
   const centroids = clusters.map((cluster, index) => {
-    if (!cluster.length) return { x: hotelAreas[index].x, y: hotelAreas[index].y };
+    const hotel = getDayHotel(index) || { x: 50, y: 50 };
+    if (!cluster.length) return { x: hotel.x, y: hotel.y };
     const mean = {
       x: cluster.reduce((sum, place) => sum + place.x, 0) / cluster.length,
       y: cluster.reduce((sum, place) => sum + place.y, 0) / cluster.length
     };
     return {
-      x: hotelAreas[index].x * 0.3 + mean.x * 0.7,
-      y: hotelAreas[index].y * 0.3 + mean.y * 0.7
+      x: hotel.x * 0.3 + mean.x * 0.7,
+      y: hotel.y * 0.3 + mean.y * 0.7
     };
   });
 
-  return clusters.map((placesForDay, index) => ({ index, places: placesForDay, centroid: centroids[index], hotel: hotelAreas[index] }));
+  return clusters.map((placesForDay, index) => ({
+    index,
+    places: placesForDay,
+    centroid: centroids[index],
+    hotel: getDayHotel(index),
+    maxStops: getDayStopCap(index),
+    isLateArrivalDay: index === 0 && day1MaxStops === 0,
+    isCityTransferDay: isCitySwitchDay(index),
+    transferMode: isCitySwitchDay(index) ? (getDayHotel(index)?.transferMode || state.cityTransferModes[index] || "train") : ""
+  }));
 }
 
-function rebalanceDayClusters(dayClusters, days, reservePool = [], hotelAreas = [], transportMode = "TRANSIT") {
+function rebalanceDayClusters(dayClusters, days, reservePool = [], hotelAreas = [], transportMode = "TRANSIT", travelPool = []) {
   const totalPlaces = dayClusters.reduce((sum, day) => sum + day.places.length, 0);
   const targetPerDay = Math.ceil(totalPlaces / Math.max(1, days));
   const assignedIds = new Set(dayClusters.flatMap((day) => day.places.map((place) => place.id)));
-  const flightDayIndex = state.flightDepartureTime ? dayClusters.length - 1 : null;
+  const flightDayIndex = state.flightDepartureTime ? days - 1 : null;
   let moved = true;
 
-  while (moved && dayClusters.some((day) => day.places.length > targetPerDay + 1)) {
+  while (moved && dayClusters.some((day) => day.places.length > Math.min(day.maxStops ?? 3, targetPerDay + 1))) {
     moved = false;
-    for (const day of dayClusters.filter((cluster) => cluster.index !== flightDayIndex && cluster.places.length > targetPerDay + 1)) {
-      const underloaded = dayClusters.filter((cluster) => cluster.index !== flightDayIndex && cluster.places.length < targetPerDay);
+    for (const day of dayClusters.filter((cluster) => cluster.index !== flightDayIndex && cluster.places.length > Math.min(cluster.maxStops ?? 3, targetPerDay + 1))) {
+      const underloaded = dayClusters.filter((cluster) => cluster.index !== flightDayIndex && cluster.places.length < Math.min(cluster.maxStops ?? 3, targetPerDay));
       if (!underloaded.length) continue;
       const move = day.places
         .slice()
@@ -1799,7 +2513,8 @@ function rebalanceDayClusters(dayClusters, days, reservePool = [], hotelAreas = 
               cluster.places,
               hotelAreas[cluster.index] || cluster.hotel,
               transportMode,
-              hotelAreas[Math.max(0, cluster.index - 1)] || hotelAreas[cluster.index] || cluster.hotel
+              hotelAreas[Math.max(0, cluster.index - 1)] || hotelAreas[cluster.index] || cluster.hotel,
+              travelPool
             ))
             .map((cluster) => ({ cluster, dist: distance(place, cluster.centroid) }))
             .sort((a, b) => a.dist - b.dist)[0];
@@ -1826,7 +2541,8 @@ function rebalanceDayClusters(dayClusters, days, reservePool = [], hotelAreas = 
         day.places,
         hotelAreas[day.index] || day.hotel,
         transportMode,
-        hotelAreas[Math.max(0, day.index - 1)] || hotelAreas[day.index] || day.hotel
+        getDayStartPoint(hotelAreas, day.index, hotelAreas[day.index] || day.hotel),
+        travelPool
       ));
       if (substituteIndex >= 0) {
         const substitute = { ...reservePool.splice(substituteIndex, 1)[0], isSubstitute: true };
@@ -1838,20 +2554,44 @@ function rebalanceDayClusters(dayClusters, days, reservePool = [], hotelAreas = 
   }
 
   for (const day of dayClusters) {
+    if (day.index === flightDayIndex) continue;
+    if ((day.maxStops ?? 3) <= 0) continue;
+    const dayHotel = hotelAreas[day.index] || day.hotel;
+    const startPoint = getDayStartPoint(hotelAreas, day.index, dayHotel);
+
+    while (day.places.length < Math.min(2, day.maxStops ?? 3)) {
+      const reserveIndex = reservePool
+        .map((place, index) => ({ place, index }))
+        .filter(({ place }) =>
+          !assignedIds.has(place.id) &&
+          (place.nominations || []).length > 0 &&
+          (!dayHotel?.city || place.city === dayHotel.city) &&
+          dayAccepts(place, day.places, dayHotel, transportMode, startPoint, travelPool)
+        )
+        .sort((a, b) => b.place.score - a.place.score)[0]?.index;
+
+      if (reserveIndex === undefined) break;
+      const [candidate] = reservePool.splice(reserveIndex, 1);
+      day.places.push(candidate);
+      assignedIds.add(candidate.id);
+    }
+  }
+
+  for (const day of dayClusters) {
     if (day.index === flightDayIndex) {
       day.places = [];
       continue;
     }
     const dayHotel = hotelAreas[day.index] || day.hotel;
-    const startPoint = hotelAreas[Math.max(0, day.index - 1)] || dayHotel;
-    while (day.places.length && !routeLegsWithinThreshold(day.places, startPoint, transportMode)) {
+    const startPoint = getDayStartPoint(hotelAreas, day.index, dayHotel);
+    while (day.places.length && !routeLegsWithinThreshold(day.places, startPoint, transportMode, travelPool)) {
       const weakest = day.places
         .map((place, index) => ({ place, index }))
         .sort((a, b) => a.place.score - b.place.score)[0];
       if (!weakest) break;
       const [dropped] = day.places.splice(weakest.index, 1);
       assignedIds.delete(dropped.id);
-      const substituteIndex = reservePool.findIndex((place) => !assignedIds.has(place.id) && dayAccepts(place, day.places, dayHotel, transportMode, startPoint));
+      const substituteIndex = reservePool.findIndex((place) => !assignedIds.has(place.id) && dayAccepts(place, day.places, dayHotel, transportMode, startPoint, travelPool));
       if (substituteIndex >= 0) {
         const substitute = { ...reservePool.splice(substituteIndex, 1)[0], isSubstitute: true };
         day.places.push(substitute);
@@ -1863,25 +2603,44 @@ function rebalanceDayClusters(dayClusters, days, reservePool = [], hotelAreas = 
   return dayClusters;
 }
 
-function dayAccepts(place, places, dayHotel, transportMode = "TRANSIT", startPoint = dayHotel) {
+function dayAccepts(place, places, dayHotel, transportMode = "TRANSIT", startPoint = dayHotel, travelPool = []) {
   if (place.city && dayHotel?.city && place.city !== dayHotel.city) {
     return false;
   }
-  return routeLegsWithinThreshold([...places, place], startPoint, transportMode);
+  return routeLegsWithinThreshold([...places, place], startPoint, transportMode, travelPool);
 }
 
-function buildDayRoutes(dayClusters, hotelAreas, transportMode = "TRANSIT") {
-  return dayClusters.map((cluster, index) => {
+function getDayStartPoint(hotelAreas, dayIndex, currentDayHotel = null) {
+  const currentHotel = hotelAreas[dayIndex] || currentDayHotel || hotelAreas[dayIndex - 1] || hotelAreas[0];
+  const previousHotel = hotelAreas[dayIndex - 1];
+  const isCitySwitchDay = dayIndex > 0 &&
+    previousHotel?.city &&
+    currentHotel?.city &&
+    previousHotel.city !== currentHotel.city;
+  return dayIndex === 0 || isCitySwitchDay
+    ? (currentHotel || hotelAreas[0])
+    : (previousHotel || currentHotel || hotelAreas[0]);
+}
+
+async function buildDayRoutes(dayClusters, hotelAreas, transportMode = "TRANSIT", reservePool = [], travelPool = []) {
+  const transitLimiter = createTransitFetchLimiter(30, 5);
+  const routes = [];
+
+  for (const [index, cluster] of dayClusters.entries()) {
     const hotel = hotelAreas[index] || cluster.hotel || { x: 50, y: 50, label: "Hotel" };
-    const startHotel = hotelAreas[Math.max(0, index - 1)] || hotel;
-    const orderedPlaces = orderRoute(cluster.places, startHotel, transportMode);
-    const places = index === dayClusters.length - 1
+    const startHotel = getDayStartPoint(hotelAreas, index, hotel) || hotel;
+    const topCandidates = [...cluster.places]
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+    const orderedPlaces = await orderRouteWithTransit(topCandidates, startHotel, transportMode, transitLimiter);
+    const trimmedPlaces = index === dayClusters.length - 1
       ? trimLastDayForFlight(orderedPlaces, getLastDayCutoffMin(hotel, transportMode))
       : orderedPlaces;
+    const places = await repairRouteLegThresholdWithTransit(trimmedPlaces, reservePool, startHotel, hotel.city, transportMode, travelPool, transitLimiter);
     const legs = buildRouteLegs(places, transportMode, startHotel);
     const vibeCounts = countBy(places, (place) => place.vibe);
     const routeCost = legs.reduce((sum, leg) => sum + leg.cost, 0);
-    return {
+    routes.push({
       day: index + 1,
       hotel,
       places,
@@ -1889,9 +2648,136 @@ function buildDayRoutes(dayClusters, hotelAreas, transportMode = "TRANSIT") {
       routeCost,
       routeMinutes: legs.reduce((sum, leg) => sum + leg.minutes, 0),
       cost: places.reduce((sum, place) => sum + place.cost, 0) + 115 + routeCost,
-      diversityWarning: Math.max(0, ...Object.values(vibeCounts)) > maxPerVibe
-    };
-  });
+      diversityWarning: Math.max(0, ...Object.values(vibeCounts)) > getMaxPerVibe(dayClusters.length),
+      isLateArrivalDay: cluster.isLateArrivalDay || false,
+      isCityTransferDay: cluster.isCityTransferDay || false,
+      transferMode: cluster.transferMode || "",
+      maxStops: cluster.maxStops
+    });
+  }
+
+  return routes;
+}
+
+function createTransitFetchLimiter(maxCalls = 30, concurrency = 5) {
+  let used = 0;
+  let active = 0;
+  const queue = [];
+
+  const pump = () => {
+    while (active < concurrency && queue.length) {
+      const job = queue.shift();
+      active += 1;
+      fetchTransitMatrix(job.origin, job.destination)
+        .then(job.resolve)
+        .catch(() => job.resolve(null))
+        .finally(() => {
+          active -= 1;
+          pump();
+        });
+    }
+  };
+
+  return {
+    fetch(origin, destination) {
+      const cached = getCachedTravelMatrix(origin, destination)?.transit;
+      if (cached) return Promise.resolve(cached);
+      if (used >= maxCalls) return Promise.resolve(null);
+      used += 1;
+      return new Promise((resolve) => {
+        queue.push({ origin, destination, resolve });
+        pump();
+      });
+    },
+    get used() {
+      return used;
+    }
+  };
+}
+
+async function getTransitMinutesForRefinement(origin, destination, transportMode, transitLimiter) {
+  if (transportMode !== "TRANSIT") return travelTimeBetween(origin, destination, transportMode);
+  const transit = await transitLimiter.fetch(origin, destination);
+  return transit?.minutes || travelTimeBetween(origin, destination, transportMode);
+}
+
+function repairRouteLegThreshold(places, reservePool = [], startPoint = null, dayCity = "", transportMode = "TRANSIT", travelPool = []) {
+  const threshold = getDynamicMaxTravel(transportMode, travelPool);
+  const repaired = [...places];
+
+  for (let index = 0; index < repaired.length; index += 1) {
+    const previous = index === 0 ? startPoint : repaired[index - 1];
+    if (!previous) continue;
+    const legMinutes = travelTimeBetween(previous, repaired[index], transportMode);
+    if (legMinutes <= threshold) continue;
+
+    const routeIds = new Set(repaired.map((place) => place.id));
+    const replacementIndex = reservePool
+      .map((place, reserveIndex) => ({ place, reserveIndex }))
+      .filter(({ place }) => {
+        if (routeIds.has(place.id)) return false;
+        if (dayCity && place.city !== dayCity) return false;
+        return travelTimeBetween(previous, place, transportMode) <= threshold;
+      })
+      .sort((a, b) => b.place.score - a.place.score)[0]?.reserveIndex;
+
+    if (replacementIndex === undefined) {
+      repaired.splice(index, 1);
+      index -= 1;
+      continue;
+    }
+
+    const [replacement] = reservePool.splice(replacementIndex, 1);
+    repaired[index] = { ...replacement, isSubstitute: true };
+  }
+
+  return repaired;
+}
+
+async function repairRouteLegThresholdWithTransit(places, reservePool = [], startPoint = null, dayCity = "", transportMode = "TRANSIT", travelPool = [], transitLimiter) {
+  if (transportMode !== "TRANSIT") {
+    return repairRouteLegThreshold(places, reservePool, startPoint, dayCity, transportMode, travelPool);
+  }
+
+  const threshold = getDynamicMaxTravel(transportMode, travelPool);
+  const repaired = [...places];
+
+  for (let index = 0; index < repaired.length; index += 1) {
+    const previous = index === 0 ? startPoint : repaired[index - 1];
+    if (!previous) continue;
+    const legMinutes = await getTransitMinutesForRefinement(previous, repaired[index], transportMode, transitLimiter);
+    if (legMinutes <= threshold) continue;
+
+    const routeIds = new Set(repaired.map((place) => place.id));
+    const reserveCandidates = reservePool
+      .filter((place) => {
+        if (routeIds.has(place.id)) return false;
+        if (dayCity && place.city !== dayCity) return false;
+        return true;
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    const replacements = await Promise.all(reserveCandidates.map(async (place) => ({
+      place,
+      minutes: await getTransitMinutesForRefinement(previous, place, transportMode, transitLimiter)
+    })));
+    const replacement = replacements
+      .filter((option) => option.minutes <= threshold)
+      .sort((a, b) => b.place.score - a.place.score)[0]?.place;
+
+    if (!replacement) {
+      repaired.splice(index, 1);
+      index -= 1;
+      continue;
+    }
+
+    const replacementIndex = reservePool.findIndex((place) => place.id === replacement.id);
+    if (replacementIndex >= 0) reservePool.splice(replacementIndex, 1);
+    repaired[index] = { ...replacement, isSubstitute: true };
+  }
+
+  return repaired;
 }
 
 function getLastDayCutoffMin(lastDayHotel = null, transportMode = "TRANSIT") {
@@ -1912,23 +2798,92 @@ function trimLastDayForFlight(route, cutoffMin) {
   return route.filter((_, index) => dayStartMin + (index + 1) * averageStopMin <= cutoffMin);
 }
 
-function orderRoute(places, accommodation = { x: 50, y: 50 }, transportMode = "TRANSIT") {
-  if (places.length < 2) return places;
-  const remaining = [...places];
-  const startIndex = remaining
-    .map((place, index) => ({ index, dist: distance(accommodation, place) }))
-    .sort((a, b) => a.dist - b.dist)[0].index;
-  const route = [remaining.splice(startIndex, 1)[0]];
+function permutations(items) {
+  if (items.length <= 1) return [items];
+  return items.flatMap((item, index) =>
+    permutations([...items.slice(0, index), ...items.slice(index + 1)])
+      .map((rest) => [item, ...rest])
+  );
+}
 
-  while (remaining.length) {
-    const current = route[route.length - 1];
-    const nextIndex = remaining
-      .map((place, index) => ({
-        index,
-        utility: place.score - travelTimeBetween(current, place, transportMode) * 0.35 - place.cost * 0.1
+function routeTransitTotal(route, startPoint, transportMode = "TRANSIT") {
+  return route.reduce((total, place, index) => {
+    const previous = index === 0 ? startPoint : route[index - 1];
+    return total + travelTimeBetween(previous, place, transportMode);
+  }, 0);
+}
+
+async function routeTransitTotalWithTransit(route, startPoint, transportMode = "TRANSIT", transitLimiter) {
+  let total = 0;
+  for (let index = 0; index < route.length; index += 1) {
+    const previous = index === 0 ? startPoint : route[index - 1];
+    total += await getTransitMinutesForRefinement(previous, route[index], transportMode, transitLimiter);
+  }
+  return total;
+}
+
+function orderRoute(places, accommodation = { x: 50, y: 50 }, transportMode = "TRANSIT") {
+  if (!places.length) return [];
+  if (places.length <= 4) {
+    return permutations(places)
+      .map((route) => ({
+        route,
+        total: routeTransitTotal(route, accommodation, transportMode)
       }))
+      .sort((a, b) => a.total - b.total)[0].route;
+  }
+
+  const maxStopsPerDay = 3;
+  const remaining = [...places];
+  const route = [];
+  let current = accommodation;
+
+  while (remaining.length && route.length < maxStopsPerDay) {
+    const nextIndex = remaining
+      .map((place, index) => {
+        const transitMinutes = travelTimeBetween(current, place, transportMode);
+        return {
+          index,
+          utility: place.score - transitMinutes * 1.5
+        };
+      })
       .sort((a, b) => b.utility - a.utility)[0].index;
-    route.push(remaining.splice(nextIndex, 1)[0]);
+    const [nextStop] = remaining.splice(nextIndex, 1);
+    route.push(nextStop);
+    current = nextStop;
+  }
+
+  return route;
+}
+
+async function orderRouteWithTransit(places, accommodation = { x: 50, y: 50 }, transportMode = "TRANSIT", transitLimiter) {
+  if (transportMode !== "TRANSIT") return orderRoute(places, accommodation, transportMode);
+  if (!places.length) return [];
+  if (places.length <= 4) {
+    const scoredRoutes = await Promise.all(permutations(places).map(async (route) => ({
+      route,
+      total: await routeTransitTotalWithTransit(route, accommodation, transportMode, transitLimiter)
+    })));
+    return scoredRoutes.sort((a, b) => a.total - b.total)[0].route;
+  }
+
+  const maxStopsPerDay = 3;
+  const remaining = [...places];
+  const route = [];
+  let current = accommodation;
+
+  while (remaining.length && route.length < maxStopsPerDay) {
+    const scored = await Promise.all(remaining.map(async (place, index) => {
+      const transitMinutes = await getTransitMinutesForRefinement(current, place, transportMode, transitLimiter);
+      return {
+        index,
+        utility: place.score - transitMinutes * 1.5
+      };
+    }));
+    const nextIndex = scored.sort((a, b) => b.utility - a.utility)[0].index;
+    const [nextStop] = remaining.splice(nextIndex, 1);
+    route.push(nextStop);
+    current = nextStop;
   }
 
   return route;
@@ -1941,8 +2896,8 @@ function maxRouteLegMinutes(places, startPoint, transportMode = "TRANSIT") {
   return Math.max(0, ...legs.map((leg) => leg.minutes));
 }
 
-function routeLegsWithinThreshold(places, startPoint, transportMode = "TRANSIT") {
-  return maxRouteLegMinutes(places, startPoint, transportMode) <= maxTravelByMode[transportMode];
+function routeLegsWithinThreshold(places, startPoint, transportMode = "TRANSIT", travelPool = []) {
+  return maxRouteLegMinutes(places, startPoint, transportMode) <= getDynamicMaxTravel(transportMode, travelPool);
 }
 
 function buildRouteLegs(places, transportMode = "TRANSIT", startPoint = null) {
@@ -1950,11 +2905,108 @@ function buildRouteLegs(places, transportMode = "TRANSIT", startPoint = null) {
     const previous = index === 0 ? startPoint : places[index - 1];
     if (!previous) return { mode: "集合", label: "起点集合", minutes: 0, cost: 0 };
     const dist = distance(previous, place);
-    const mode = getLegMode(dist, transportMode);
-    const minutes = Math.round(travelTimeBetween(previous, place, transportMode));
+    const transit = transportMode === "TRANSIT" ? getCachedTravelMatrix(previous, place)?.transit : null;
+    const minutes = transit?.minutes || Math.round(travelTimeBetween(previous, place, transportMode));
+    const mode = transit
+      ? (transit.minutes <= 20 ? "步行" : inferTransitModeFromApi(transit.raw, { mode: getLegMode(dist, transportMode) }))
+      : (transportMode === "TRANSIT" ? (minutes <= 20 ? "步行" : "公交") : getLegMode(dist, transportMode));
     const cost = mode === "步行" ? 0 : mode === "公交" ? 4 : mode === "驾车" ? 12 : 7;
     return { mode, label: `${mode} ${minutes} 分钟`, minutes, cost };
   });
+}
+
+async function enrichTaxiLabels(trip) {
+  if (!trip?.itineraryDays?.length) return trip;
+
+  await Promise.all(trip.itineraryDays.map(async (day, dayIndex) => {
+    const startPoint = getDayStartPoint(trip.hotelAreas, dayIndex, day.hotel);
+    const enrichedLegs = await Promise.all(day.places.map(async (place, index) => {
+      const previous = index === 0 ? startPoint : day.places[index - 1];
+      const leg = day.legs[index] || buildRouteLegs([place], trip.transportMode, previous)[0];
+      const drive = await fetchDriveMatrix(previous, place);
+      return drive ? { ...leg, taxiLabel: buildTaxiLabel(drive, trip.country) } : leg;
+    }));
+
+    day.legs = enrichedLegs;
+    day.routeCost = enrichedLegs.reduce((sum, leg) => sum + leg.cost, 0);
+    day.routeMinutes = enrichedLegs.reduce((sum, leg) => sum + leg.minutes, 0);
+    day.cost = day.places.reduce((sum, place) => sum + place.cost, 0) + 115 + day.routeCost;
+  }));
+
+  trip.legs = trip.itineraryDays.flatMap((day) => day.legs);
+  trip.routeCost = trip.itineraryDays.reduce((sum, day) => sum + day.routeCost, 0);
+  return trip;
+}
+
+async function enrichItineraryTravelDetails(trip) {
+  if (!trip?.itineraryDays?.length) return trip;
+
+  await Promise.all(trip.itineraryDays.map(async (day, dayIndex) => {
+    const startPoint = getDayStartPoint(trip.hotelAreas, dayIndex, day.hotel);
+    const enrichedLegs = [];
+
+    for (let index = 0; index < day.places.length; index += 1) {
+      const place = day.places[index];
+      const previous = index === 0 ? startPoint : day.places[index - 1];
+      const fallbackLeg = buildRouteLegs([place], trip.transportMode, previous)[0];
+      const matrix = await fetchTravelMatrix(previous, place);
+      enrichedLegs.push(matrix ? buildApiRouteLeg(matrix, fallbackLeg, trip.country) : fallbackLeg);
+    }
+
+    day.legs = enrichedLegs;
+    day.routeCost = enrichedLegs.reduce((sum, leg) => sum + leg.cost, 0);
+    day.routeMinutes = enrichedLegs.reduce((sum, leg) => sum + leg.minutes, 0);
+    day.cost = day.places.reduce((sum, place) => sum + place.cost, 0) + 115 + day.routeCost;
+  }));
+
+  trip.legs = trip.itineraryDays.flatMap((day) => day.legs);
+  trip.routeCost = trip.itineraryDays.reduce((sum, day) => sum + day.routeCost, 0);
+  const hotelCost = trip.costBreakdown?.hotelCost || 0;
+  const activityCost = trip.places.reduce((sum, place) => sum + place.cost, 0) + trip.days * 115 + trip.routeCost;
+  trip.costBreakdown.activityCost = activityCost;
+  trip.total = activityCost + hotelCost;
+  trip.algorithm.routeMinutes = trip.legs.reduce((sum, leg) => sum + leg.minutes, 0);
+  return trip;
+}
+
+function buildApiRouteLeg(matrix, fallbackLeg, country) {
+  const transit = matrix.transit;
+  const drive = matrix.drive;
+  if (!transit) return fallbackLeg;
+
+  const mode = transit.minutes <= 20
+    ? "步行"
+    : inferTransitModeFromApi(transit.raw, fallbackLeg);
+  const cost = mode === "步行" ? 0 : fallbackLeg.cost;
+  const taxiLabel = drive ? buildTaxiLabel(drive, country) : "";
+
+  return {
+    ...fallbackLeg,
+    mode,
+    label: `${mode} ${transit.minutes} 分钟`,
+    minutes: transit.minutes,
+    cost,
+    taxiLabel
+  };
+}
+
+function inferTransitModeFromApi(raw, fallbackLeg) {
+  const payload = JSON.stringify(raw || {}).toLowerCase();
+  if (payload.includes("subway") || payload.includes("metro") || payload.includes("rail") || payload.includes("train")) return "地铁";
+  if (payload.includes("bus")) return "公交";
+  return ["公交", "地铁"].includes(fallbackLeg?.mode) ? fallbackLeg.mode : "公交";
+}
+
+function buildTaxiLabel(drive, country) {
+  const rate = getTaxiRate(country);
+  const km = Math.max(0, (drive.distanceMeters || 0) / 1000);
+  const fare = Math.round(rate.base + km * rate.perKm);
+  return `🚕 约 ${drive.minutes} 分钟 · ~$${fare} 仅供参考`;
+}
+
+function getTaxiRate(country) {
+  if (country === "England") return taxiRateUSD.UK;
+  return taxiRateUSD[country] || taxiRateUSD.default;
 }
 
 function getLegMode(dist, transportMode = "TRANSIT") {
@@ -1963,6 +3015,33 @@ function getLegMode(dist, transportMode = "TRANSIT") {
 }
 
 function travelTimeBetween(a, b, transportMode = "TRANSIT") {
+  if (transportMode === "TRANSIT") {
+    const realTransit = getCachedTravelMatrix(a, b)?.transit?.minutes;
+    if (realTransit) return realTransit;
+  }
+  return estimateTransitMinutes(a, b, transportMode);
+}
+
+function estimateTransitMinutes(place1, place2, transportMode = "TRANSIT") {
+  const existingEstimate = estimateGridTransitMinutes(place1, place2, transportMode);
+
+  if (!hasLatLng(place1) || !hasLatLng(place2)) {
+    return existingEstimate;
+  }
+
+  const km = haversineKm(place1, place2);
+  if (!Number.isFinite(km)) return existingEstimate;
+  const urbanDistance = km * 1.2; // 城市街道弯曲系数
+
+  if (transportMode === "DRIVING") return Math.round(km / 30 * 60 + 5);
+  const walkingMinutes = Math.round(urbanDistance / 0.067);
+  if (walkingMinutes > 20) {
+    return Math.round(urbanDistance / 20 * 60 + 8);
+  }
+  return walkingMinutes;
+}
+
+function estimateGridTransitMinutes(a, b, transportMode = "TRANSIT") {
   const dist = distance(a, b);
   if (transportMode === "DRIVING") {
     return dist < 20 ? dist * 2 : dist * 1;
@@ -1970,6 +3049,40 @@ function travelTimeBetween(a, b, transportMode = "TRANSIT") {
   if (dist < 15) return dist * 3;
   if (dist < 35) return dist * 2;
   return dist * 1.2;
+}
+
+function haversineKm(place1, place2) {
+  const R = 6371;
+  const dLat = (place2.lat - place1.lat) * Math.PI / 180;
+  const dLng = (place2.lng - place1.lng) * Math.PI / 180;
+  const lat1 = place1.lat * Math.PI / 180;
+  const lat2 = place2.lat * Math.PI / 180;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1) *
+    Math.cos(lat2) *
+    Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+function hasLatLng(place) {
+  return Number.isFinite(Number(place?.lat)) && Number.isFinite(Number(place?.lng));
+}
+
+function getDynamicMaxTravel(transportMode, places) {
+  const base = maxTravelByMode[transportMode] || 50;
+  if (places.length < 2) return base;
+  let total = 0;
+  let count = 0;
+  for (let i = 0; i < places.length; i += 1) {
+    for (let j = i + 1; j < places.length; j += 1) {
+      total += travelTimeBetween(places[i], places[j], transportMode);
+      count += 1;
+    }
+  }
+  const avgDist = total / count;
+  if (avgDist > 35) return base + 20;
+  if (avgDist > 25) return base + 10;
+  return base;
 }
 
 function estimateTotal(places, days, transportMode = "TRANSIT") {
@@ -1989,42 +3102,11 @@ function normalizeText(value) {
   return (value || "").toLowerCase().replace(/\s+/g, "");
 }
 
-const placeAliases = {
-  "金阁寺": "kinkakuji",
-  "kinkaku-ji": "kinkakuji",
-  "kinkakuji": "kinkakuji",
-  "岚山竹林": "arashiyamabambooforest",
-  "arashiyama bamboo forest": "arashiyamabambooforest",
-  "arashiyamabambooforest": "arashiyamabambooforest",
-  "伏见稻荷大社": "fushimiinaritaisha",
-  "fushimi inari taisha": "fushimiinaritaisha",
-  "fushimiinaritaisha": "fushimiinaritaisha",
-  "锦市场": "nishikimarket",
-  "nishiki market": "nishikimarket",
-  "nishikimarket": "nishikimarket",
-  "根津美术馆": "nezumuseum",
-  "nezu museum": "nezumuseum",
-  "nezumuseum": "nezumuseum",
-  "筑地场外市场": "tsukijifishmarket",
-  "tsukiji outer market": "tsukijifishmarket",
-  "新宿黄金街": "shinjukukabukicho",
-  "golden gai": "shinjukukabukicho",
-  "teamlab planets": "teamlabplanets",
-  "teamlab planets tokyo dmm": "teamlabplanets",
-  "上野公园": "uenopark",
-  "ueno park": "uenopark",
-  "uenopark": "uenopark",
-  "上野": "uenopark"
-};
-
 function normalizeForMatch(text) {
   const lowerWithSpaces = (text || "").toLowerCase();
-  const lower = lowerWithSpaces
+  return lowerWithSpaces
     .replace(/\s+/g, "")
     .replace(/[·•\-]/g, "");
-  return placeAliases[lower] ||
-         placeAliases[lowerWithSpaces] ||
-         lower;
 }
 
 function hashString(value) {
@@ -2043,8 +3125,17 @@ function renderTrip() {
   const trip = state.latestTrip;
   if (!trip) return;
 
+  if (exportPdfButton) {
+    exportPdfButton.style.display = "";
+    exportPdfButton.textContent = state.language === "en" ? "Export PDF" : "导出 PDF";
+  }
   const hotelSummary = summarizeHotelAreas(trip.hotelAreas);
   title.textContent = `${trip.plan.label} · ${trip.days} 天 · ${hotelSummary}`;
+  if (itineraryDisclaimer) {
+    itineraryDisclaimer.textContent = state.language === "en"
+      ? "* All times are in local time · All prices are in USD and for reference only"
+      : "* 所有时间均为当地时间 · 所有价格以美元（USD）计算，仅供参考";
+  }
   personaCopy.textContent = buildPersona(trip);
   renderAlgorithm(trip);
   renderAlerts(trip);
@@ -2115,7 +3206,9 @@ function renderAlerts(trip) {
   const departure = new Date(departureInput.value);
   const today = new Date();
   const daysUntil = Math.ceil((departure - today) / (1000 * 60 * 60 * 24));
-  const visaDays = trip.plan.visaDays[nationalityInput.value] ?? 0;
+  const visaDays = typeof trip.plan.visaDays === "number"
+    ? trip.plan.visaDays
+    : trip.plan.visaDays?.[nationalityInput.value] ?? 0;
   const alerts = [];
 
   if (visaDays > 0 && daysUntil < visaDays) {
@@ -2193,8 +3286,8 @@ function renderBudget(trip) {
   budgetFill.style.width = `${Math.min(100, Math.round(ratio * 100))}%`;
   budgetFill.style.background = ratio > 1.15 ? "var(--coral)" : ratio > 1.0 ? "var(--gold)" : "var(--mint)";
   budgetCaption.textContent = state.language === "en"
-    ? `${travelerCount} travelers · ${roomsNeeded} room(s) · $${hotelCostPerRoomPerNight}/room/night · $${hotelCostPerPersonPerNight}/person/night · Activity budget $${activityBudgetPerDay}/day/person`
-    : `${travelerCount} 人出行 · ${roomsNeeded} 间客房 · $${hotelCostPerRoomPerNight}/间/晚 · 每人分摊 $${hotelCostPerPersonPerNight}/晚 · 活动预算 $${activityBudgetPerDay}/天/人`;
+    ? `${travelerCount} travelers · ${roomsNeeded} room(s) · $${hotelCostPerRoomPerNight}/room/night · $${hotelCostPerPersonPerNight}/person/night · Activity budget $${activityBudgetPerDay}/day/person · * Hotel cost is an estimate`
+    : `${travelerCount} 人出行 · ${roomsNeeded} 间客房 · $${hotelCostPerRoomPerNight}/间/晚 · 每人分摊 $${hotelCostPerPersonPerNight}/晚 · 活动预算 $${activityBudgetPerDay}/天/人 · * 酒店费用为估算值`;
 }
 
 function renderReservePool(trip) {
@@ -2205,7 +3298,12 @@ function renderReservePool(trip) {
   const finalIds = new Set(trip.places.map((place) => place.id));
   const reserveCandidates = (trip.allCandidates || [])
     .filter((place) => !finalIds.has(place.id))
-    .sort((a, b) => b.score - a.score);
+    .sort((a, b) => {
+      const aVotes = getWishlistCount(a.id);
+      const bVotes = getWishlistCount(b.id);
+      if (aVotes !== bVotes) return bVotes - aVotes;
+      return b.score - a.score;
+    });
 
   if (reservePoolCount) {
     reservePoolCount.textContent = state.language === "en"
@@ -2231,15 +3329,40 @@ function renderReservePool(trip) {
     .map((place) => {
       const vibe = vibeOptions.find((item) => item[0] === place.vibe);
       const vibeLabel = vibe ? (state.language === "zh" ? vibe[1] : vibe[0]) : place.vibe;
+      const wishlistCount = getWishlistCount(place.id);
+      const wishlisted = isPlaceWishlisted(place.id);
+      const canEdit = canEditItinerary();
+      const wishlistLabel = state.language === "en"
+        ? `${wishlistCount} want to go`
+        : `${wishlistCount}人想去`;
       return `
         <div class="reserve-card"
              data-reserve-id="${place.id}"
              data-lat="${place.lat || ""}"
              data-lng="${place.lng || ""}">
-          <div class="reserve-card-name">${place.name}</div>
+          <div class="reserve-card-topline">
+            <div class="reserve-card-name">${place.name}</div>
+            <div class="reserve-card-actions">
+              <button class="reserve-wishlist-btn"
+                      type="button"
+                      data-wishlist-id="${place.id}"
+                      aria-label="${state.language === "en" ? "Want to go" : "想去"}">
+                ${wishlisted ? "❤️" : "🤍"}
+              </button>
+              ${canEdit ? `
+                <button class="reserve-add-btn"
+                        type="button"
+                        data-add-id="${place.id}">
+                  ${state.language === "en" ? "Add to itinerary" : "加入行程"}
+                </button>
+              ` : ""}
+            </div>
+          </div>
           <div class="reserve-card-meta">
             <span class="reserve-card-vibe">${vibeLabel}</span>
             <span class="reserve-card-cost">$${place.cost}</span>
+            ${landmarkBadgeHtml(place)}
+            ${wishlistCount ? `<span class="reserve-wishlist-count">❤️ ${wishlistLabel}</span>` : ""}
           </div>
           <div class="reserve-card-score">
             ${place.score}/100 ·
@@ -2249,6 +3372,208 @@ function renderReservePool(trip) {
       `;
     })
     .join("");
+}
+
+function getWishlistCount(placeId) {
+  if (sharedTripId || activeInviteTrip?.id) return wishlistState.counts.get(placeId) || 0;
+  return localWishlist.has(placeId) ? 1 : 0;
+}
+
+function isPlaceWishlisted(placeId) {
+  if (sharedTripId || activeInviteTrip?.id) return wishlistState.mine.has(placeId);
+  return localWishlist.has(placeId);
+}
+
+function canEditItinerary() {
+  return isSharedPlanner === true || !(sharedTripId || activeInviteTrip?.id || window._activeTripId);
+}
+
+function showAddToItineraryModal(place) {
+  const trip = state.latestTrip;
+  if (!trip || !place) return;
+
+  const modal = document.createElement("div");
+  modal.className = "invite-modal-backdrop";
+  const rows = trip.itineraryDays.map((day, dayIndex) => `
+    <button class="itinerary-edit-row"
+            type="button"
+            data-add-day="${dayIndex}">
+      <span>Day ${day.day}</span>
+      <strong>${day.places.length} ${state.language === "en" ? "stops" : "个景点"}</strong>
+    </button>
+  `).join("");
+
+  modal.innerHTML = `
+    <div class="invite-modal itinerary-edit-modal" role="dialog" aria-modal="true">
+      <h3>${state.language === "en" ? "Add to which day?" : "加入哪一天？"}</h3>
+      <p class="muted">${place.name}</p>
+      <div class="itinerary-edit-list">${rows}</div>
+      <button class="secondary-button itinerary-edit-cancel" type="button">
+        ${state.language === "en" ? "Cancel" : "取消"}
+      </button>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  modal.querySelector(".itinerary-edit-cancel")?.addEventListener("click", () => modal.remove());
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) modal.remove();
+  });
+  modal.querySelectorAll(".itinerary-edit-row").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const dayIndex = Number(button.dataset.addDay);
+      const day = trip.itineraryDays[dayIndex];
+      if (day?.places?.length >= 3) {
+        showFullDayConfirm(() => addReservePlaceToDay(place, dayIndex));
+        modal.remove();
+        return;
+      }
+      modal.remove();
+      await addReservePlaceToDay(place, dayIndex);
+    });
+  });
+}
+
+function showFullDayConfirm(onConfirm) {
+  const modal = document.createElement("div");
+  modal.className = "invite-modal-backdrop";
+  modal.innerHTML = `
+    <div class="invite-modal itinerary-edit-modal" role="dialog" aria-modal="true">
+      <h3>${state.language === "en" ? "This day already has 3 stops. Confirm?" : "该天已有3个景点，确认添加？"}</h3>
+      <div class="invite-link-row">
+        <button class="secondary-button itinerary-edit-cancel" type="button">
+          ${state.language === "en" ? "Cancel" : "取消"}
+        </button>
+        <button class="primary-button itinerary-edit-confirm" type="button">
+          ${state.language === "en" ? "Confirm" : "确认"}
+        </button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.querySelector(".itinerary-edit-cancel")?.addEventListener("click", () => modal.remove());
+  modal.querySelector(".itinerary-edit-confirm")?.addEventListener("click", async () => {
+    modal.remove();
+    await onConfirm();
+  });
+}
+
+async function removeItineraryStop(dayIndex, stopIndex) {
+  const trip = state.latestTrip;
+  const day = trip?.itineraryDays?.[dayIndex];
+  if (!trip || !day || !day.places?.[stopIndex]) return;
+
+  const [removedStop] = day.places.splice(stopIndex, 1);
+  trip.allCandidates = Array.isArray(trip.allCandidates) ? trip.allCandidates : [];
+  if (!trip.allCandidates.some((candidate) => candidate.id === removedStop.id)) {
+    trip.allCandidates.push(removedStop);
+  }
+  const startPoint = getDayStartPoint(trip.hotelAreas, dayIndex, day.hotel);
+  day.places = orderRoute(day.places, startPoint, trip.transportMode);
+  await recalculateDayTravel(trip, dayIndex);
+  await finishItineraryEdit(trip, state.language === "en" ? "Stop removed" : "已移出");
+}
+
+async function addReservePlaceToDay(place, dayIndex) {
+  const trip = state.latestTrip;
+  const day = trip?.itineraryDays?.[dayIndex];
+  if (!trip || !day || !place) return;
+
+  trip.allCandidates = Array.isArray(trip.allCandidates) ? trip.allCandidates : [];
+  if (!trip.allCandidates.some((candidate) => candidate.id === place.id)) {
+    trip.allCandidates.push(place);
+  }
+  if (!day.places.some((candidate) => candidate.id === place.id)) {
+    day.places.push({ ...place, isSubstitute: false });
+  }
+  const startPoint = getDayStartPoint(trip.hotelAreas, dayIndex, day.hotel);
+  day.places = orderRoute(day.places, startPoint, trip.transportMode);
+  await recalculateDayTravel(trip, dayIndex);
+  await finishItineraryEdit(trip, state.language === "en" ? "Added to itinerary" : "已加入行程");
+}
+
+async function recalculateDayTravel(trip, dayIndex) {
+  const day = trip.itineraryDays[dayIndex];
+  const startPoint = getDayStartPoint(trip.hotelAreas, dayIndex, day.hotel);
+  const legs = [];
+
+  for (let index = 0; index < day.places.length; index += 1) {
+    const place = day.places[index];
+    const previous = index === 0 ? startPoint : day.places[index - 1];
+    const fallbackLeg = buildRouteLegs([place], trip.transportMode, previous)[0];
+    const matrix = await fetchTravelMatrix(previous, place);
+    legs.push(matrix ? buildApiRouteLeg(matrix, fallbackLeg, trip.country) : fallbackLeg);
+  }
+
+  day.legs = legs;
+  day.routeCost = legs.reduce((sum, leg) => sum + leg.cost, 0);
+  day.routeMinutes = legs.reduce((sum, leg) => sum + leg.minutes, 0);
+  day.cost = day.places.reduce((sum, place) => sum + place.cost, 0) + 115 + day.routeCost;
+}
+
+async function finishItineraryEdit(trip, toastMessage) {
+  recomputeTripAfterEdit(trip);
+  renderTrip();
+  if (sharedTripId) await persistGeneratedItinerary();
+  showToast(toastMessage);
+}
+
+function recomputeTripAfterEdit(trip) {
+  trip.places = trip.itineraryDays.flatMap((day) => day.places);
+  trip.legs = trip.itineraryDays.flatMap((day) => day.legs || []);
+  trip.routeCost = trip.itineraryDays.reduce((sum, day) => sum + (day.routeCost || 0), 0);
+  const hotelCost = trip.costBreakdown?.hotelCost || 0;
+  const activityCost = trip.places.reduce((sum, place) => sum + place.cost, 0) + trip.days * 115 + trip.routeCost;
+  trip.costBreakdown.activityCost = activityCost;
+  trip.total = activityCost + hotelCost;
+  trip.algorithm.routeMinutes = trip.legs.reduce((sum, leg) => sum + leg.minutes, 0);
+  trip.algorithm.selectedCount = trip.places.length;
+  trip.algorithm.averageScore = Math.round(trip.places.reduce((sum, place) => sum + place.score, 0) / Math.max(1, trip.places.length));
+  trip.algorithm.substituteCount = trip.places.filter((place) => place.isSubstitute).length;
+  trip.algorithm.systemCount = trip.places.filter((place) => place.source === "system").length;
+  const finalIds = new Set(trip.places.map((place) => place.id));
+  trip.algorithm.reserveCount = (trip.allCandidates || []).filter((place) => !finalIds.has(place.id)).length;
+}
+
+async function toggleReserveWishlist(placeId) {
+  if (!placeId) return;
+  const tripId = sharedTripId || activeInviteTrip?.id || window._activeTripId;
+  if (!tripId || !currentSharedMemberName) {
+    if (localWishlist.has(placeId)) localWishlist.delete(placeId);
+    else localWishlist.add(placeId);
+    if (state.latestTrip) renderReservePool(state.latestTrip);
+    return;
+  }
+
+  const supabase = await getSupabaseBrowserClient();
+  const { data: member, error } = await supabase
+    .from("members")
+    .select("id,wishlist")
+    .eq("trip_id", tripId)
+    .ilike("name", currentSharedMemberName)
+    .maybeSingle();
+  if (error || !member) {
+    if (error) console.error(error);
+    return;
+  }
+
+  const current = Array.isArray(member.wishlist) ? member.wishlist : [];
+  const next = new Set(current.filter(Boolean));
+  if (next.has(placeId)) next.delete(placeId);
+  else next.add(placeId);
+
+  const { error: updateError } = await supabase
+    .from("members")
+    .update({ wishlist: [...next] })
+    .eq("id", member.id);
+  if (updateError) {
+    console.error(updateError);
+    return;
+  }
+
+  wishlistState.mine = new Set(next);
+  await renderInviteProgress(tripId);
+  if (state.latestTrip) renderReservePool(state.latestTrip);
 }
 
 function renderGoogleMap(trip) {
@@ -2395,6 +3720,7 @@ function renderItinerary(trip) {
   itineraryList.innerHTML = trip.itineraryDays
     .map((day) => {
       const dayColor = DAY_COLORS[(day.day - 1) % DAY_COLORS.length];
+      const canEdit = canEditItinerary();
       const cards = day.places.map((place, index) => {
         const currentIndex = globalIndex;
         globalIndex += 1;
@@ -2418,14 +3744,26 @@ function renderItinerary(trip) {
                   line-height: 20px;
                   margin-right: 6px;
                   vertical-align: middle;
-                ">${index + 1}</span>
-                ${place.name}${place.isSubstitute ? " · SUBSTITUTE" : ""}
-              </h3>
-              <strong>${place.score}/100</strong>
-            </div>
-            <p>${place.description}</p>
+	                ">${index + 1}</span>
+	                ${place.name}${place.isSubstitute ? " · SUBSTITUTE" : ""}
+	              </h3>
+	              <div class="place-card-actions">
+	                <strong>${place.score}/100</strong>
+                  ${landmarkBadgeHtml(place)}
+	                ${canEdit ? `
+	                  <button class="stop-remove-btn"
+	                          type="button"
+	                          data-remove-day="${day.day - 1}"
+	                          data-remove-stop="${index}">
+	                    ${state.language === "en" ? "Remove" : "移出"}
+	                  </button>
+	                ` : ""}
+	              </div>
+	            </div>
+            ${getPlaceDescription(place) ? `<p>${getPlaceDescription(place)}</p>` : ""}
             <div class="route-meta">
               <span class="route-chip">${transport} ${leg.label}</span>
+              ${leg.taxiLabel ? `<span class="route-chip taxi-chip">${leg.taxiLabel}</span>` : ""}
               <span class="route-chip">${place.consensus}% 共识 · ${names}</span>
               <span class="route-chip">$${place.cost} · ${place.rationale}</span>
             </div>
@@ -2439,7 +3777,7 @@ function renderItinerary(trip) {
             <strong style="color: ${dayColor}">
               Day ${day.day}
             </strong>
-            <span>${day.hotel.label} · ${day.places.length} ${state.language === "en" ? "stops" : "站"} · ${day.routeMinutes} min · $${day.cost}${day.diversityWarning ? (state.language === "en" ? " · ⚠ vibe concentration" : " · ⚠ 氛围集中") : ""}${day.places.some((place) => place.isSubstitute) ? " · substitute" : ""}</span>
+            <span>${day.hotel.label} · ${day.places.length} ${state.language === "en" ? "stops" : "站"} · ${day.routeMinutes} min · $${day.cost}${day.isLateArrivalDay ? (state.language === "en" ? " · ✈ Late arrival — no stops scheduled for Day 1" : " · ✈ 到达时间较晚，第一天不安排行程") : ""}${day.isCityTransferDay ? (state.language === "en" ? ` · ${transferIconForMode(day.transferMode)} City transfer day · Light schedule recommended` : ` · ${transferIconForMode(day.transferMode)} 换城日 · 建议轻行程`) : ""}${day.diversityWarning ? (state.language === "en" ? " · ⚠ vibe concentration" : " · ⚠ 氛围集中") : ""}${day.places.some((place) => place.isSubstitute) ? " · substitute" : ""}</span>
           </div>
           ${cards || `<p class="muted">No stops assigned yet.</p>`}
         </section>
@@ -2456,35 +3794,145 @@ function transportIconForLeg(leg) {
   return "🚇";
 }
 
+function transferIconForMode(mode) {
+  return mode === "flight" ? "✈️" : mode === "bus" ? "🚌" : "🚄";
+}
+
+function getPlaceDescription(place) {
+  return place.editorialSummary || place.description || "";
+}
+
+function escapeHtml(value = "") {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function isLandmarkPlace(place) {
+  return (place?.userRatingCount || 0) > 10000;
+}
+
+function landmarkBadgeHtml(place) {
+  if (!isLandmarkPlace(place)) return "";
+  return `<span class="landmark-badge">${state.language === "en" ? "🏛 Landmark" : "🏛 著名景点"}</span>`;
+}
+
+function renderDetailModal(place, options = {}) {
+  const trip = state.latestTrip;
+  detailImage.src = place.image || "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=900&q=82";
+  detailImage.alt = place.name || "";
+  const placeCity = place.city || trip?.destination || trip?.plan?.label || "";
+  detailKicker.textContent = options.kicker || (state.language === "en"
+    ? `${placeCity}${trip?.country ? `, ${trip.country}` : ""} · Route detail`
+    : `${placeCity}${trip?.country ? `，${t("countryNames")[trip.country] || trip.country}` : ""} · 路径详情`);
+  detailTitle.textContent = place.name || "";
+
+  const description = getPlaceDescription(place);
+  const address = place.formattedAddress || "";
+  const leg = options.leg || null;
+  const supporters = (place.supporters || []).map((traveler) => traveler.name);
+  const nominatedBy = (place.nominations || []).map((item) => `${item.member} #${item.rank}`);
+  const matchReason = [
+    place.rationale,
+    nominatedBy.length ? (state.language === "en" ? `Nominated by ${nominatedBy.join(", ")}` : `成员提名：${nominatedBy.join("、")}`) : "",
+    place.source && place.source !== "nominated" ? (state.language === "en" ? "System discovery candidate" : "系统发现候选") : ""
+  ].filter(Boolean).join(" · ");
+  const vibeMatch = supporters.length
+    ? supporters.join(state.language === "en" ? ", " : "、")
+    : (state.language === "en" ? "No direct member vibe match" : "暂无直接成员氛围匹配");
+  const metadataRows = [
+    address ? [state.language === "en" ? "Address" : "地址", address] : null,
+    place.cost !== undefined ? [state.language === "en" ? "Estimated cost" : "预计单点花费", `$${place.cost}`] : null,
+    leg?.label ? [state.language === "en" ? "Transit from previous stop" : "从上一站衔接方式", leg.label] : null,
+    matchReason ? [state.language === "en" ? "Match reason" : "推荐理由", matchReason] : null,
+    [state.language === "en" ? "Vibe match" : "氛围匹配", vibeMatch],
+    place.score !== undefined ? [state.language === "en" ? "Score" : "综合评分", `${place.score}/100`] : null
+  ].filter(Boolean);
+
+  detailBody.innerHTML = `
+    ${description ? `<p class="detail-summary">${escapeHtml(description)}</p>` : ""}
+    ${metadataRows.length ? `
+      <div class="detail-meta">
+        ${metadataRows.map(([label, value]) => `
+          <div><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value)}</div>
+        `).join("")}
+      </div>
+    ` : ""}
+  `;
+  detailBody.style.display = description || metadataRows.length ? "" : "none";
+  if (!dialog.open) dialog.showModal();
+}
+
+async function fetchReservePlaceDetails(place) {
+  if (!place) return null;
+  const cacheKey = place.googlePlaceId || place.id || place.name;
+  if (placeDetailsCache.has(cacheKey)) return placeDetailsCache.get(cacheKey);
+
+  let details = null;
+
+  try {
+    if (place.googlePlaceId) {
+      const res = await fetch(`/api/places?type=details&placeId=${encodeURIComponent(place.googlePlaceId)}`);
+      const data = await res.json();
+      if (!data.error) details = data;
+    }
+    if (!details) {
+      const params = new URLSearchParams({
+        type: "nomination",
+        query: place.name || ""
+      });
+      if (place.lat && place.lng) {
+        params.set("lat", place.lat);
+        params.set("lng", place.lng);
+      }
+      const res = await fetch(`/api/places?${params}`);
+      const data = await res.json();
+      details = data.places?.[0] || null;
+    }
+  } catch {}
+
+  const photoName = details?.photos?.[0]?.name || null;
+  const enriched = {
+    ...place,
+    image: photoName ? `/api/photo?name=${encodeURIComponent(photoName)}` : place.image,
+    editorialSummary: details?.editorialSummary?.text || place.editorialSummary || "",
+    formattedAddress: details?.formattedAddress || place.formattedAddress || "",
+    googlePlaceId: details?.id || place.googlePlaceId || "",
+    userRatingCount: details?.userRatingCount || place.userRatingCount || 0,
+    lat: details?.location?.latitude || place.lat || null,
+    lng: details?.location?.longitude || place.lng || null
+  };
+  placeDetailsCache.set(cacheKey, enriched);
+  if (enriched.googlePlaceId && enriched.googlePlaceId !== cacheKey) {
+    placeDetailsCache.set(enriched.googlePlaceId, enriched);
+  }
+  return enriched;
+}
+
 function showDetail(index) {
   const trip = state.latestTrip;
   const place = trip.places[index];
   state.activeIndex = index;
   renderGoogleMap(trip);
-  detailImage.src = place.image;
-  detailImage.alt = place.name;
-  const placeCity = place.city ||
-    trip.destination ||
-    trip.plan.label;
-  const kickerLabel = state.language === "en"
-    ? `${placeCity}, ${trip.country} · Route detail`
-    : `${placeCity}，${t("countryNames")[trip.country] || trip.country} · 路径详情`;
-  detailKicker.textContent = kickerLabel;
-  detailTitle.textContent = place.name;
-  const supporters = place.supporters.map((traveler) => traveler.name);
-  const nominatedBy = place.nominations.map((item) => `${item.member} #${item.rank}`);
-  const leg = trip.legs[index];
-  detailBody.textContent = state.language === "en"
-    ? `${place.description} Estimated cost is $${place.cost}; connection from previous stop is ${leg.label}. ${place.isSubstitute ? `This is a reserve-pool substitute that satisfies the ${trip.algorithm.maxTravelMin}-minute same-day travel constraint. ` : ""}${nominatedBy.length ? `Nominated by: ${nominatedBy.join(", ")}. ` : "System recommendation used for discovery and route diversity. "}${supporters.length ? `Vibe match: ${supporters.join(", ")}. ` : ""}Algorithm rationale: ${place.rationale}.`
-    : `${place.description} 预计单点花费 $${place.cost}，从上一站衔接方式为 ${leg.label}。${place.isSubstitute ? `这是备用池替换点，用于满足当前交通方式下单日任意两点不超过 ${trip.algorithm.maxTravelMin} 分钟的移动约束。` : ""}${nominatedBy.length ? `成员提名：${nominatedBy.join("、")}。` : "系统推荐点，用于补足发现模式和路线多样性。"}${supporters.length ? `氛围匹配：${supporters.join("、")}。` : ""}算法理由：${place.rationale}。`;
-  dialog.showModal();
+  renderDetailModal(place, { leg: trip.legs[index] });
 }
 
 function updateHash(trip) {
   const payload = {
     d: trip.destination,
     cities: state.cities,
-    hotels: trip.hotelAreas.map((hotel) => ({ city: hotel.city, areaId: hotel.id })),
+    hotels: trip.hotelAreas.map((hotel, index) => ({
+      city: hotel.city,
+      id: hotel.id,
+      areaId: hotel.id,
+      label: hotel.label,
+      lat: hotel.lat || null,
+      lng: hotel.lng || null,
+      transferMode: hotel.transferMode || state.cityTransferModes[index] || "train"
+    })),
     n: nationalityInput.value,
     day: trip.days,
     min: trip.budgetMin,
@@ -2498,6 +3946,9 @@ function updateHash(trip) {
     airport: state.departureAirport,
     flight: state.flightDepartureTime,
     flightTime: state.flightDepartureTime,
+    arrivalAirport: state.arrivalAirport,
+    arrivalTime: state.flightArrivalTime,
+    cityTransferModes: state.cityTransferModes,
     travelers: travelers.map((traveler) => ({
       vibes: traveler.vibes,
       mustVisits: traveler.mustVisits
@@ -2508,10 +3959,13 @@ function updateHash(trip) {
 
 function restoreFromHash() {
   if (!location.hash) return;
+
   try {
     const payload = JSON.parse(decodeURIComponent(location.hash.slice(1)));
-    if (payload.country && countryCities[payload.country]) countryInput.value = payload.country;
-    else countryInput.value = inferCountryForCity(payload.d || destinationInput.value);
+    countryInput.value = payload.country || inferCountryForCity(payload.d || destinationInput.value);
+    state.countryCode = countryCodeByName[normalizeCountryName(countryInput.value)] || state.countryCode || "";
+    renderCountryTag();
+    updateCityAutocompleteRestriction();
     if (Array.isArray(payload.cities)) {
       state.cities = payload.cities;
     } else {
@@ -2522,7 +3976,7 @@ function restoreFromHash() {
     if (payload.day) daysInput.value = payload.day;
     const savedHotels = Array.isArray(payload.hotels)
       ? payload.hotels
-      : Array.from({ length: Number(payload.day || daysInput.value || 1) }, () => ({ city: state.cities[0], areaId: payload.a })).filter((item) => item.areaId);
+      : Array.from({ length: Math.max(0, Number(payload.day || daysInput.value || 1) - 1) }, () => ({ city: state.cities[0], areaId: payload.a })).filter((item) => item.areaId);
     renderAccommodationOptions(savedHotels);
     if (payload.min) budgetMinInput.value = payload.min;
     if (payload.max) budgetMaxInput.value = payload.max;
@@ -2542,6 +3996,18 @@ function restoreFromHash() {
     } else if (payload.flight) {
       state.flightDepartureTime = payload.flight;
       if (flightDepTimeInput) flightDepTimeInput.value = payload.flight;
+    }
+    if (payload.arrivalAirport) {
+      state.arrivalAirport = payload.arrivalAirport;
+      if (arrivalAirportInput) arrivalAirportInput.value = payload.arrivalAirport;
+    }
+    if (payload.arrivalTime) {
+      state.flightArrivalTime = payload.arrivalTime;
+      if (flightArrivalTimeInput) flightArrivalTimeInput.value = payload.arrivalTime;
+    }
+    if (payload.cityTransferModes && typeof payload.cityTransferModes === "object") {
+      state.cityTransferModes = payload.cityTransferModes;
+      renderAccommodationOptions(savedHotels);
     }
     if (payload.lang && i18n[payload.lang]) {
       state.language = payload.lang;
@@ -2567,7 +4033,455 @@ function showToast(message) {
   window.setTimeout(() => toast.classList.remove("show"), 2200);
 }
 
+async function getSupabaseBrowserClient() {
+  if (supabaseBrowserClient) return supabaseBrowserClient;
+  const [{ createClient }, configRes] = await Promise.all([
+    import("https://cdn.jsdelivr.net/npm/@supabase/supabase-js/+esm"),
+    fetch("/api/config")
+  ]);
+  const config = await configRes.json();
+  if (!config.supabaseUrl || !config.supabaseKey) {
+    throw new Error("Supabase public env vars are not configured");
+  }
+  supabaseBrowserClient = createClient(config.supabaseUrl, config.supabaseKey);
+  return supabaseBrowserClient;
+}
+
+function readTripFormState() {
+  const days = Number(daysInput.value || 5);
+  const plan = getActivePlan();
+  return {
+    destination: state.cities[0] || destinationInput.value,
+    country: countryInput.value,
+    cities: state.cities,
+    days,
+    budget_min: Number(budgetMinInput.value || 0),
+    budget_max: Number(budgetMaxInput.value || 0),
+    transport_mode: transportModeInput.value,
+    hotel_stars: Number(hotelStarsInput.value || 3),
+    flight_departure_time: state.flightDepartureTime,
+    airport: state.departureAirport,
+    flight_arrival_time: state.flightArrivalTime,
+    arrival_airport: state.arrivalAirport,
+    city_transfer_modes: state.cityTransferModes,
+    departure_date: departureInput.value || null,
+    hotel_areas: getHotelAreas(plan, days),
+    language: state.language
+  };
+}
+
+function travelerToMemberPayload(traveler, tripId, isPlanner = false) {
+  return {
+    trip_id: tripId,
+    name: traveler.name,
+    vibes: traveler.vibes,
+    must_visits: traveler.mustVisits,
+    budget: typeof traveler.budget === 'number'
+      ? traveler.budget
+      : parseInt(String(traveler.budget).replace(/[^0-9]/g, '')) *
+        (String(traveler.budget).toLowerCase().includes('k') ? 1000 : 1) || 0,
+    is_planner: isPlanner,
+    filled_at: new Date().toISOString()
+  };
+}
+
+async function persistGeneratedItinerary() {
+  const tripId = sharedTripId || window._activeTripId || activeInviteTrip?.id;
+  if (!tripId || !state.latestTrip) return;
+
+  try {
+    const supabase = await getSupabaseBrowserClient();
+    const { error } = await supabase
+      .from("trips")
+      .update({ generated_itinerary: state.latestTrip })
+      .eq("id", tripId);
+    if (error) console.error(error);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+function memberToTraveler(member, index) {
+  const palette = ["#1c6b7a", "#d85d47", "#0f8f73", "#6c5ce7", "#f0a04b"];
+  return {
+    name: member.name || `Member ${index + 1}`,
+    role: member.is_planner ? "Planner" : "Teammate",
+    budget: member.budget || "",
+    vibes: Array.isArray(member.vibes) ? member.vibes : [],
+    mustVisits: normalizeMustVisits(member.must_visits),
+    wishlist: Array.isArray(member.wishlist) ? member.wishlist : [],
+    color: palette[index % palette.length]
+  };
+}
+
+function syncWishlistFromMembers(members = []) {
+  wishlistState.counts = new Map();
+  wishlistState.mine = new Set();
+  members.forEach((member) => {
+    const wishlist = Array.isArray(member.wishlist) ? member.wishlist : [];
+    const uniqueWishlist = new Set(wishlist.filter(Boolean));
+    uniqueWishlist.forEach((placeId) => {
+      wishlistState.counts.set(placeId, (wishlistState.counts.get(placeId) || 0) + 1);
+      if (member.name === currentSharedMemberName) {
+        wishlistState.mine.add(placeId);
+      }
+    });
+  });
+}
+
+function syncTravelersFromMembers(members = []) {
+  syncWishlistFromMembers(members);
+  const nextTravelers = members.map(memberToTraveler);
+  if (!nextTravelers.length) return;
+  travelers.splice(0, travelers.length, ...nextTravelers);
+  renderTravelers();
+}
+
+function getDemoTravelersForLocalTesting() {
+  return demoTravelers.map((traveler) => ({
+    ...traveler,
+    vibes: [...traveler.vibes],
+    mustVisits: [...traveler.mustVisits]
+  }));
+}
+
+async function generateFromMembersOrDemo() {
+  if (activeInviteTrip?.id) {
+    const supabase = await getSupabaseBrowserClient();
+    const { data: latestMembers, error: membersError } = await supabase
+      .from("members")
+      .select("*")
+      .eq("trip_id", activeInviteTrip.id)
+      .not("filled_at", "is", null)
+      .order("created_at", { ascending: true });
+    if (membersError) throw membersError;
+    syncTravelersFromMembers(latestMembers || []);
+    await generateTrip((latestMembers || []).map(memberToTraveler));
+    if (activeMembersChannel && state.latestTrip) {
+      activeMembersChannel.send({
+        type: "broadcast",
+        event: "itinerary",
+        payload: state.latestTrip
+      }).catch(console.error);
+    }
+    return;
+  }
+  await generateTrip(getDemoTravelersForLocalTesting());
+}
+
+function sharedMemberStorageKey(tripId) {
+  return `wetrip_member_${tripId}`;
+}
+
+function sharedPlannerStorageKey(tripId) {
+  return `wetrip_planner_${tripId}`;
+}
+
+function setSharedTripPermissions() {
+  if (!sharedTripId) return;
+  const canEditTrip = isSharedPlanner;
+  const controls = [
+    countryInput, destinationInput, cityAddSelect, cityAddBtn, daysInput,
+    travelerCountInput, budgetMinInput, budgetMaxInput, discoveryModeInput,
+    transportModeInput, hotelStarsInput, departureAirportInput, flightDepTimeInput,
+    arrivalAirportInput, flightArrivalTimeInput,
+    nationalityInput, departureInput, languageInput, applyHotelAll
+  ].filter(Boolean);
+  controls.forEach((control) => {
+    control.disabled = !canEditTrip;
+  });
+  hotelAreaList?.querySelectorAll("select,input").forEach((control) => {
+    control.disabled = !canEditTrip;
+  });
+  cityTags?.querySelectorAll("button").forEach((button) => {
+    button.disabled = !canEditTrip;
+  });
+  if (shareButton) shareButton.style.display = "";
+  if (regenerate) regenerate.style.display = canEditTrip ? "" : "none";
+  form?.querySelector("button[type='submit']")?.style.setProperty("display", canEditTrip ? "" : "none");
+}
+
+async function saveSharedCurrentMember() {
+  if (!sharedTripId || !currentSharedMemberName) return;
+  const member = travelers.find((traveler) => traveler.name === currentSharedMemberName);
+  if (!member) return;
+  const supabase = await getSupabaseBrowserClient();
+  const { error } = await supabase
+    .from("members")
+    .update({
+      vibes: member.vibes,
+      must_visits: member.mustVisits.map((item) => item.trim()).filter(Boolean),
+      budget: typeof member.budget === "number" ? member.budget : parseInt(String(member.budget).replace(/[^0-9]/g, "")) || 0,
+      filled_at: new Date().toISOString()
+    })
+    .eq("trip_id", sharedTripId)
+    .ilike("name", currentSharedMemberName);
+  if (error) console.error(error);
+}
+
+function scheduleSharedMemberSave() {
+  if (!sharedTripId || !currentSharedMemberName) return;
+  clearTimeout(memberSaveTimer);
+  memberSaveTimer = setTimeout(() => {
+    saveSharedCurrentMember().catch(console.error);
+  }, 500);
+}
+
+function showIdentityModal(tripId, members = []) {
+  const modal = document.createElement("div");
+  modal.className = "invite-modal-backdrop";
+  const options = members.map((member) => `
+    <button class="secondary-button identity-pick" type="button" data-member-name="${member.name}">
+      ${member.name}
+    </button>
+  `).join("");
+  modal.innerHTML = `
+    <div class="invite-modal" role="dialog" aria-modal="true">
+      <p class="label">We-trip</p>
+      <h3>${state.language === "en" ? "Who are you?" : "你是谁？"}</h3>
+      <div class="identity-options">${options}</div>
+      <div class="invite-link-row">
+        <input class="identity-name-input" placeholder="${state.language === "en" ? "Enter a new name" : "输入新名字"}" />
+        <button class="primary-button identity-new" type="button">${state.language === "en" ? "Continue" : "继续"}</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+
+  const identify = async (name, createIfMissing = false) => {
+    const cleanName = String(name || "").trim();
+    if (!cleanName) return;
+    const supabase = await getSupabaseBrowserClient();
+    if (createIfMissing && !members.some((member) => String(member.name || "").toLowerCase() === cleanName.toLowerCase())) {
+      const { error } = await supabase.from("members").insert({
+        trip_id: tripId,
+        name: cleanName,
+        budget: Number(budgetMaxInput.value || 0),
+        vibes: [],
+        must_visits: ["", "", ""],
+        filled_at: new Date().toISOString()
+      });
+      if (error) {
+        showToast(error.message);
+        return;
+      }
+    }
+    currentSharedMemberName = cleanName;
+    window.localStorage.setItem(sharedMemberStorageKey(tripId), cleanName);
+    modal.remove();
+    await renderInviteProgress(tripId);
+    setSharedTripPermissions();
+  };
+
+  modal.querySelectorAll(".identity-pick").forEach((button) => {
+    button.addEventListener("click", () => {
+      identify(button.dataset.memberName, false).catch(console.error);
+    });
+  });
+  modal.querySelector(".identity-new")?.addEventListener("click", () => {
+    const input = modal.querySelector(".identity-name-input");
+    identify(input?.value, true).catch(console.error);
+  });
+}
+
+function showInviteModal(inviteUrl, tripId = null) {
+  const modal = document.createElement("div");
+  modal.className = "invite-modal-backdrop";
+  modal.innerHTML = `
+    <div class="invite-modal" role="dialog" aria-modal="true">
+      <button class="icon-button invite-modal-close" type="button" aria-label="Close">×</button>
+      <p class="label">${state.language === "en" ? "Invite link" : "邀请链接"}</p>
+      <h3>${state.language === "en" ? "Share with teammates" : "分享给队友填写偏好"}</h3>
+      <div class="invite-link-row">
+        <input class="invite-link-input" readonly value="${inviteUrl}" />
+        <button class="secondary-button invite-copy-button" type="button">${state.language === "en" ? "Copy" : "复制"}</button>
+      </div>
+      <button class="primary-button invite-go-button" type="button">
+        ${state.language === "en" ? "Go to shared page" : "前往共享页面"}
+      </button>
+      <p class="muted">${state.language === "en" ? "Members can fill their own vibes and must-visit places asynchronously." : "队友可异步填写自己的氛围和必去地点。"}</p>
+    </div>
+  `;
+  document.body.appendChild(modal);
+  modal.querySelector(".invite-modal-close").addEventListener("click", () => modal.remove());
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) modal.remove();
+  });
+  modal.querySelector(".invite-copy-button").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(inviteUrl);
+    showToast(state.language === "en" ? "Invite link copied" : "邀请链接已复制");
+  });
+  modal.querySelector(".invite-go-button")?.addEventListener("click", () => {
+    window.location.href = tripId ? `/trip/${tripId}` : inviteUrl;
+  });
+}
+
+async function renderInviteProgress(tripId) {
+  const supabase = await getSupabaseBrowserClient();
+  const { data, error } = await supabase
+    .from("members")
+    .select("*")
+    .eq("trip_id", tripId)
+    .order("created_at", { ascending: true });
+  if (error) throw error;
+
+  const members = data || [];
+  syncTravelersFromMembers(members);
+  setSharedTripPermissions();
+  if (state.latestTrip) renderReservePool(state.latestTrip);
+}
+
+async function subscribeInviteProgress(tripId) {
+  window._activeTripId = tripId;
+  const supabase = await getSupabaseBrowserClient();
+  if (activeMembersChannel) {
+    await supabase.removeChannel(activeMembersChannel);
+    activeMembersChannel = null;
+  }
+  activeMembersChannel = supabase
+    .channel(`members-trip-${tripId}`)
+    .on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "members",
+      filter: `trip_id=eq.${tripId}`
+    }, () => {
+      renderInviteProgress(tripId).catch(console.error);
+    })
+    .on("broadcast", { event: "itinerary" }, ({ payload }) => {
+      state.latestTrip = payload;
+      renderTrip();
+    })
+    .subscribe();
+  await renderInviteProgress(tripId);
+}
+
+function applyTripPayloadToForm(trip) {
+  if (!trip) return;
+  if (trip.country) {
+    countryInput.value = trip.country;
+    state.countryCode = countryCodeByName[normalizeCountryName(trip.country)] || state.countryCode || "";
+    renderCountryTag();
+    updateCityAutocompleteRestriction();
+  }
+  if (Array.isArray(trip.cities) && trip.cities.length) {
+    state.cities = trip.cities;
+  } else if (trip.destination) {
+    state.cities = [trip.destination];
+  }
+  if (destinationInput && state.cities[0]) destinationInput.value = state.cities[0];
+  renderCityTags();
+  if (trip.days) daysInput.value = trip.days;
+  if (trip.budget_min !== undefined) budgetMinInput.value = trip.budget_min;
+  if (trip.budget_max !== undefined) budgetMaxInput.value = trip.budget_max;
+  if (trip.transport_mode) transportModeInput.value = trip.transport_mode;
+  if (trip.hotel_stars) hotelStarsInput.value = trip.hotel_stars;
+  if (trip.flight_departure_time) {
+    state.flightDepartureTime = trip.flight_departure_time;
+    if (flightDepTimeInput) flightDepTimeInput.value = trip.flight_departure_time;
+  }
+  if (trip.airport) {
+    state.departureAirport = trip.airport;
+    if (departureAirportInput) departureAirportInput.value = trip.airport;
+  }
+  if (trip.arrival_airport || trip.arrivalAirport) {
+    state.arrivalAirport = trip.arrival_airport || trip.arrivalAirport;
+    if (arrivalAirportInput) arrivalAirportInput.value = state.arrivalAirport;
+  }
+  if (trip.flight_arrival_time || trip.flightArrivalTime) {
+    state.flightArrivalTime = trip.flight_arrival_time || trip.flightArrivalTime;
+    if (flightArrivalTimeInput) flightArrivalTimeInput.value = state.flightArrivalTime;
+  }
+  if (trip.city_transfer_modes || trip.cityTransferModes) {
+    state.cityTransferModes = trip.city_transfer_modes || trip.cityTransferModes || {};
+  }
+  if (trip.language && i18n[trip.language]) {
+    state.language = trip.language;
+    if (languageInput) languageInput.value = trip.language;
+    applyLanguage();
+  }
+  renderAccommodationOptions(Array.isArray(trip.hotel_areas) ? trip.hotel_areas : []);
+  updateFlightTimeVisibility();
+}
+
+async function restoreInviteTripFromQuery() {
+  const tripId = new URLSearchParams(window.location.search).get("trip_id");
+  if (!tripId) return;
+  const supabase = await getSupabaseBrowserClient();
+  const { data: trip, error } = await supabase
+    .from("trips")
+    .select("*")
+    .eq("id", tripId)
+    .single();
+  if (error) throw error;
+  activeInviteTrip = trip;
+  window._activeTripId = tripId;
+  applyTripPayloadToForm(trip);
+  await subscribeInviteProgress(tripId);
+}
+
+async function loadSharedTrip(tripId) {
+  sharedTripId = tripId;
+  window._activeTripId = tripId;
+  const storedMemberName = window.localStorage.getItem(sharedMemberStorageKey(tripId));
+  isSharedPlanner = window.localStorage.getItem(sharedPlannerStorageKey(tripId)) === "true";
+  currentSharedMemberName = storedMemberName || null;
+  const supabase = await getSupabaseBrowserClient();
+  const { data: trip, error } = await supabase
+    .from("trips")
+    .select("*")
+    .eq("id", tripId)
+    .single();
+  if (error) throw error;
+  activeInviteTrip = trip;
+  applyTripPayloadToForm(trip);
+  if (trip.generated_itinerary) {
+    state.latestTrip = trip.generated_itinerary;
+    state.activeIndex = 0;
+  }
+  const { data: members, error: membersError } = await supabase
+    .from("members")
+    .select("*")
+    .eq("trip_id", tripId)
+    .order("created_at", { ascending: true });
+  if (membersError) throw membersError;
+  syncTravelersFromMembers(members || []);
+  setSharedTripPermissions();
+  if (state.latestTrip) renderTrip();
+  await subscribeInviteProgress(tripId);
+  if (!storedMemberName) {
+    showIdentityModal(tripId, members || []);
+  }
+}
+
+async function createInviteTrip() {
+  const supabase = await getSupabaseBrowserClient();
+  const tripPayload = readTripFormState();
+  const { data: trip, error: tripError } = await supabase
+    .from("trips")
+    .insert(tripPayload)
+    .select("*")
+    .single();
+  if (tripError) throw tripError;
+
+  const planner = travelers[0];
+  const { error: memberError } = await supabase
+    .from("members")
+    .insert(travelerToMemberPayload(planner, trip.id, true));
+  if (memberError) throw memberError;
+
+  activeInviteTrip = trip;
+  window._activeTripId = trip.id;
+  currentSharedMemberName = planner.name;
+  window.localStorage.setItem(sharedPlannerStorageKey(trip.id), "true");
+  window.localStorage.setItem(sharedMemberStorageKey(trip.id), planner.name);
+  const inviteUrl = `${window.location.origin}/trip/${trip.id}`;
+  showInviteModal(inviteUrl, trip.id);
+  return trip;
+}
+
 destinationInput.addEventListener("change", () => {
+  cityCentersCache = {};
   state.cities = [destinationInput.value];
   renderCityTags();
   renderAccommodationOptions();
@@ -2577,20 +4491,43 @@ destinationInput.addEventListener("change", () => {
 });
 
 countryInput.addEventListener("change", () => {
-  state.cities = [
-    countryCities[countryInput.value]?.[0] || "Tokyo"
-  ];
+  setCountrySelection(countryInput.value, countryCodeByName[normalizeCountryName(countryInput.value)] || "");
+});
+
+countryInput.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  setCountrySelection(countryInput.value, countryCodeByName[normalizeCountryName(countryInput.value)] || "");
+});
+
+countryTags?.addEventListener("click", (event) => {
+  const removeBtn = event.target.closest("[data-remove-country]");
+  if (!removeBtn) return;
+  countryInput.value = "";
+  state.countryCode = "";
+  state.cities = [];
+  cityCentersCache = {};
+  renderCountryTag();
+  updateCityAutocompleteRestriction();
   renderCityTags();
   resetMustVisitsForDestination();
   renderTravelers();
-  generateTrip();
+  generateTrip().catch(console.error);
 });
 
 daysInput.addEventListener("change", () => {
-  renderAccommodationOptions(Array.from({ length: Number(daysInput.value || 1) }, (_, index) => {
+  renderAccommodationOptions(Array.from({ length: Math.max(0, Number(daysInput.value || 1) - 1) }, (_, index) => {
     const city = hotelAreaList.querySelector(`.hotel-city-select[data-hotel-day="${index}"]`)?.value;
-    const areaId = hotelAreaList.querySelector(`.hotel-area-select[data-hotel-day="${index}"]`)?.value;
-    return city || areaId ? { city, areaId } : null;
+    const areaInput = hotelAreaList.querySelector(`.hotel-area-input[data-hotel-day="${index}"]`);
+    const transferMode = hotelAreaList.querySelector(`.city-transfer-select[data-transfer-day="${index}"]`)?.value;
+    return city || areaInput?.value ? {
+      city,
+      id: areaInput?.dataset.areaId || slugify(areaInput?.value || city),
+      label: areaInput?.value || `${city} center`,
+      lat: Number(areaInput?.dataset.lat) || null,
+      lng: Number(areaInput?.dataset.lng) || null,
+      transferMode
+    } : null;
   }).filter(Boolean));
   generateTrip();
 });
@@ -2604,31 +4541,38 @@ cityTags?.addEventListener("click", (event) => {
   const city = removeBtn.dataset.removeCity;
   if (state.cities.length <= 1) return;
   state.cities = state.cities.filter((item) => item !== city);
+  delete cityCentersCache[city];
   renderCityTags();
+  resetMustVisitsForDestination();
+  renderTravelers();
   generateTrip().catch(console.error);
 });
 
 cityAddBtn?.addEventListener("click", () => {
   const city = cityAddSelect?.value;
-  if (!city || state.cities.includes(city)) return;
-  state.cities.push(city);
-  renderCityTags();
-  generateTrip().catch(console.error);
+  addCityTag(city);
+});
+
+cityAddSelect?.addEventListener("keydown", (event) => {
+  if (event.key !== "Enter") return;
+  event.preventDefault();
+  addCityTag(cityAddSelect.value);
 });
 
 applyHotelAll.addEventListener("click", () => {
   const firstCity = hotelAreaList.querySelector(".hotel-city-select")?.value;
-  const firstArea = hotelAreaList.querySelector(".hotel-area-select")?.value;
-  if (!firstCity && !firstArea) return;
+  const firstArea = hotelAreaList.querySelector(".hotel-area-input");
+  if (!firstCity && !firstArea?.value) return;
   hotelAreaList.querySelectorAll(".hotel-city-select").forEach((select) => {
     select.value = firstCity;
   });
-  hotelAreaList.querySelectorAll(".hotel-area-select").forEach((select) => {
-    select.innerHTML = getAreasForCity(firstCity)
-      .map(([id, label]) => `<option value="${id}">${label}</option>`)
-      .join("");
-    select.value = firstArea;
+  hotelAreaList.querySelectorAll(".hotel-area-input").forEach((input) => {
+    input.value = firstArea?.value || `${firstCity} center`;
+    input.dataset.areaId = firstArea?.dataset.areaId || slugify(input.value);
+    input.dataset.lat = firstArea?.dataset.lat || "";
+    input.dataset.lng = firstArea?.dataset.lng || "";
   });
+  updateCityTransferControls();
   generateTrip();
 });
 discoveryModeInput.addEventListener("change", generateTrip);
@@ -2642,17 +4586,26 @@ flightDepTimeInput.addEventListener("change", () => {
   state.flightDepartureTime = flightDepTimeInput.value;
   generateTrip();
 });
+arrivalAirportInput?.addEventListener("change", () => {
+  state.arrivalAirport = arrivalAirportInput.value;
+  updateFlightTimeVisibility();
+  generateTrip();
+});
+flightArrivalTimeInput?.addEventListener("change", () => {
+  state.flightArrivalTime = flightArrivalTimeInput.value;
+  generateTrip();
+});
 languageInput.addEventListener("change", () => {
   state.language = languageInput.value;
   applyLanguage();
-  renderAccommodationOptions([...hotelAreaList.querySelectorAll("[data-hotel-day]")].map((select) => select.value));
+  renderAccommodationOptions(getHotelAreas(getActivePlan(), Number(daysInput.value || 1)));
   renderTravelers();
   generateTrip();
 });
 
 form.addEventListener("submit", (event) => {
   event.preventDefault();
-  generateTrip();
+  generateFromMembersOrDemo().catch(console.error);
 });
 
 regenerate.addEventListener("click", () => {
@@ -2665,23 +4618,217 @@ regenerate.addEventListener("click", () => {
   showToast("已基于同行者偏好重新合成路线");
 });
 
-shareButton.addEventListener("click", async () => {
-  const url = window.location.href;
+async function exportTripPDF() {
+
   try {
-    await navigator.clipboard.writeText(url);
-    showToast("只读分享链接已复制");
-  } catch {
-    showToast(url);
+    if (!window.html2canvas || !window.jspdf?.jsPDF) {
+      showToast(state.language === "zh" ? "PDF 工具加载中，请稍后再试" : "PDF tools are still loading. Try again soon.");
+      return;
+    }
+    if (!state.latestTrip || !pdfExport) return;
+    showToast(state.language === "zh" ? "生成中..." : "Generating...");
+    pdfExport.innerHTML = buildPdfExportHtml(state.latestTrip);
+    pdfExport.style.display = "block";
+    pdfExport.style.position = "absolute";
+    pdfExport.style.left = "-9999px";
+    pdfExport.style.top = "0";
+    const canvas = await window.html2canvas(pdfExport, { scale: 2, useCORS: true, backgroundColor: "#ffffff" });
+    pdfExport.style.display = "none";
+    const { jsPDF } = window.jspdf;
+    const pdf = new jsPDF("p", "mm", "a4");
+    const imgWidth = 210;
+    const imgHeight = canvas.height * imgWidth / canvas.width;
+    let position = 0;
+    const pageHeight = 297;
+    while (position < imgHeight) {
+      pdf.addImage(canvas, "PNG", 0, -position, imgWidth, imgHeight);
+      position += pageHeight;
+      if (position < imgHeight) pdf.addPage();
+    }
+    const destination = state.latestTrip?.destination || "trip";
+    const date = new Date().toISOString().slice(0, 10);
+    pdf.save(`wetrip-${destination}-${date}.pdf`);
+  } catch (error) {
+    console.error(error);
+    if (pdfExport) pdfExport.style.display = "none";
+    showToast(state.language === "zh" ? "PDF 导出失败" : "PDF export failed");
   }
+}
+
+function buildPdfExportHtml(trip) {
+  const isEn = state.language === "en";
+  const hotelSummary = summarizeHotelAreas(trip.hotelAreas);
+  const travelersCount = travelers.length || trip.costBreakdown?.travelerCount || 1;
+  const destinationLabel = escapeHtml((trip.cities?.length ? trip.cities.join(" + ") : trip.destination) || trip.plan?.label || "");
+  const countryLabel = escapeHtml(t("countryNames")[trip.country] || trip.country || "");
+  const departureDate = formatPdfDate(departureInput.value);
+  const nights = Math.max(0, trip.days - 1);
+  const hotelStars = trip.hotelStars || Number(hotelStarsInput.value || 3);
+  const budgetMin = trip.budgetMin ?? Number(budgetMinInput.value || 0);
+  const budgetMax = trip.budgetMax ?? Number(budgetMaxInput.value || 0);
+  const disclaimer = isEn
+    ? "* All times are in local time · All prices are in USD and for reference only"
+    : "* 所有时间均为当地时间 · 所有价格以美元（USD）计算，仅供参考";
+  const divider = `<div style="border-top:1px solid #dfe7e4;margin:14px 0"></div>`;
+  const membersHtml = travelers.map((traveler) => {
+    const vibeNames = (traveler.vibes || [])
+      .map((id) => vibeOptions.find((item) => item[0] === id)?.[state.language === "en" ? 0 : 1] || id)
+      .join(isEn ? ", " : "、");
+    const mustVisits = normalizeMustVisits(traveler.mustVisits || [])
+      .filter(Boolean)
+      .map(escapeHtml)
+      .join(" / ");
+    return `
+      <div style="font-size:12px;color:#555;line-height:1.55;margin:7px 0 0">
+        <div><strong style="color:#25322f">• ${escapeHtml(traveler.name || (isEn ? "Traveler" : "成员"))}</strong>${vibeNames ? ` — ${escapeHtml(vibeNames)}` : ""}</div>
+        ${mustVisits ? `<div style="padding-left:12px">${isEn ? "Want to visit" : "想去"}: ${mustVisits}</div>` : ""}
+      </div>
+    `;
+  }).join("");
+  const summaryHtml = `
+    <section style="margin:16px 0 18px">
+      <div style="font-size:16px;font-weight:900;color:#1c6b7a;margin-bottom:8px">
+        WE-TRIP · ${isEn ? "Group Travel Planning Assistant" : "多人旅行规划助手"}
+      </div>
+      ${divider}
+      <div style="display:grid;gap:5px;font-size:12px;color:#555;line-height:1.5">
+        <div><strong style="color:#25322f">${isEn ? "Destination" : "目的地"}:</strong> ${destinationLabel}${countryLabel ? `, ${countryLabel}` : ""}</div>
+        <div><strong style="color:#25322f">${isEn ? "Travel dates" : "出行日期"}:</strong> ${departureDate} · ${trip.days}${isEn ? " days" : "天"}${nights}${isEn ? " nights" : "晚"}</div>
+        <div><strong style="color:#25322f">${isEn ? "Travelers" : "出行人数"}:</strong> ${travelersCount}${isEn ? " travelers" : "人"} · ${hotelStars}★${isEn ? " hotel" : "酒店"}</div>
+        <div><strong style="color:#25322f">${isEn ? "Budget range" : "预算范围"}:</strong> $${budgetMin} - $${budgetMax} /${isEn ? "person" : "人"}</div>
+        <div><strong style="color:#25322f">${isEn ? "Overall score" : "综合评分"}:</strong> ${trip.algorithm?.averageScore || 0}/100 · ${isEn ? "Route travel" : "路线交通"}: ${trip.algorithm?.routeMinutes || 0} min</div>
+      </div>
+      ${divider}
+      <div style="font-size:13px;font-weight:900;color:#1c6b7a;margin-bottom:4px">${isEn ? "Team members" : "团队成员"}:</div>
+      ${membersHtml || `<div style="font-size:12px;color:#888">${isEn ? "No members listed." : "暂无成员信息。"}</div>`}
+      ${divider}
+    </section>
+  `;
+  const usageGuideHtml = `
+    <section style="padding:18px 0 0;border-top:2px solid #eef3f1;break-inside:avoid">
+      <h2 style="margin:0 0 8px;color:#1c6b7a;font-size:18px;line-height:1.2">${isEn ? "About this itinerary" : "关于本行程"}</h2>
+      <ul style="margin:0;padding-left:18px;font-size:12px;color:#666;line-height:1.65">
+        <li>${isEn ? "All times are in local time" : "所有时间均为当地时间"}</li>
+        <li>${isEn ? "All prices are in USD and for reference only" : "所有价格以美元（USD）计算，仅供参考"}</li>
+        <li>${isEn ? "Hotel costs are estimates; actual prices vary by date and room type" : "酒店费用为估算值，实际价格因时间和房型而异"}</li>
+        <li>${isEn ? "Transit times are estimates; check live Google Maps routes before departure" : "交通时间为估算值，建议出发前确认 Google Maps 实时路线"}</li>
+        <li>${isEn ? "The itinerary is generated by WE-TRIP AI from team preferences and can be adjusted manually on the web" : "行程由 WE-TRIP AI 根据团队偏好自动生成，可在网页端手动调整"}</li>
+        <li>${isEn ? "Visit wetrip.ai anytime to edit or regenerate the itinerary" : "访问 wetrip.ai 可随时修改行程或重新生成"}</li>
+      </ul>
+    </section>
+  `;
+  const daysHtml = trip.itineraryDays.map((day) => {
+    const dayColor = DAY_COLORS[(day.day - 1) % DAY_COLORS.length];
+    const stopsHtml = day.places.map((place, index) => {
+      const leg = day.legs?.[index] || {};
+      const description = escapeHtml(getPlaceDescription(place) || "");
+      const summary = description
+        ? `<div style="font-size:12px;color:#555;line-height:1.45;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:4px">${description}</div>`
+        : "";
+      const taxi = leg.taxiLabel ? `<span style="color:#666"> · ${escapeHtml(leg.taxiLabel)}</span>` : "";
+      const landmark = isLandmarkPlace(place)
+        ? `<span style="display:inline-block;margin-left:6px;padding:2px 6px;border-radius:999px;background:#f2f3f5;color:#777;font-size:10px;font-weight:700">🏛 ${isEn ? "Landmark" : "著名景点"}</span>`
+        : "";
+      return `
+        <div style="display:flex;gap:12px;padding:12px 0;border-top:1px solid #edf0ef;background:#fff">
+          <div style="width:24px;height:24px;border-radius:50%;background:${dayColor};color:#fff;font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center;flex:0 0 auto">
+            ${index + 1}
+          </div>
+          <div style="min-width:0;flex:1">
+            <div style="display:flex;align-items:center;justify-content:space-between;gap:10px">
+              <div style="font-size:15px;font-weight:800;color:#18211f">${escapeHtml(place.name)}${landmark}</div>
+              <div style="font-size:12px;font-weight:800;color:#1c6b7a;white-space:nowrap">${place.score || 0}/100</div>
+            </div>
+            ${summary}
+            <div style="font-size:11px;color:#777;margin-top:5px">
+              ${escapeHtml(leg.label || (isEn ? "Transit time pending" : "交通时间待计算"))}${taxi}
+            </div>
+          </div>
+        </div>
+      `;
+    }).join("");
+    return `
+      <section style="padding:18px 0;border-top:2px solid #eef3f1;break-inside:avoid">
+        <h2 style="margin:0 0 4px;color:#1c6b7a;font-size:18px;line-height:1.2">
+          Day ${day.day}
+        </h2>
+        <div style="font-size:12px;color:#666;margin-bottom:8px">
+          ${escapeHtml(day.hotel?.label || "")} · ${day.routeMinutes || 0} min · $${day.cost || 0}
+        </div>
+        ${stopsHtml || `<div style="font-size:12px;color:#888;padding:10px 0">${isEn ? "No stops scheduled." : "当天不安排行程。"}</div>`}
+      </section>
+    `;
+  }).join("");
+
+  return `
+    <div style="background:#fff;color:#17211f;font-family:Arial,'Microsoft YaHei',sans-serif">
+      <header style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+        <div style="width:54px;height:40px;border-radius:999px;background:#1c6b7a;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:900">
+          We
+        </div>
+        <div>
+          <div style="font-size:25px;font-weight:900;color:#1c6b7a;letter-spacing:0">WE-TRIP</div>
+          <div style="font-size:12px;color:#777">
+            ${escapeHtml(trip.plan?.label || trip.destination || "")} · ${trip.days} ${isEn ? "days" : "天"} · ${escapeHtml(hotelSummary)} · ${travelersCount} ${isEn ? "travelers" : "人"}
+          </div>
+        </div>
+      </header>
+      <p style="font-size:11px;color:#888;margin:4px 0 16px">${disclaimer}</p>
+      ${summaryHtml}
+      ${daysHtml}
+      ${usageGuideHtml}
+    </div>
+  `;
+}
+
+function formatPdfDate(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return escapeHtml(value);
+  return `${date.getFullYear()}/${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
+}
+
+exportPdfButton?.addEventListener("click", () => {
+  exportTripPDF().catch(console.error);
 });
 
 itineraryList.addEventListener("click", (event) => {
+  const removeButton = event.target.closest(".stop-remove-btn");
+  if (removeButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    removeItineraryStop(
+      Number(removeButton.dataset.removeDay),
+      Number(removeButton.dataset.removeStop)
+    ).catch(console.error);
+    return;
+  }
+
   const card = event.target.closest("[data-index]");
   if (!card) return;
   showDetail(Number(card.dataset.index));
 });
 
-document.addEventListener("click", (event) => {
+document.addEventListener("click", async (event) => {
+  const wishlistButton = event.target.closest(".reserve-wishlist-btn");
+  if (wishlistButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    await toggleReserveWishlist(wishlistButton.dataset.wishlistId);
+    return;
+  }
+
+  const addButton = event.target.closest(".reserve-add-btn");
+  if (addButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const trip = state.latestTrip;
+    const place = (trip?.allCandidates || [])
+      .find((candidate) => candidate.id === addButton.dataset.addId);
+    if (place) showAddToItineraryModal(place);
+    return;
+  }
+
   const card = event.target.closest(".reserve-card");
   if (!card) return;
 
@@ -2693,59 +4840,51 @@ document.addEventListener("click", (event) => {
     .forEach((item) => item.classList.remove("active"));
   card.classList.add("active");
 
-  if (!googleMap || !window.google || Number.isNaN(lat) || Number.isNaN(lng)) return;
-
-  const position = { lat, lng };
-  googleMap.panTo(position);
-  googleMap.setZoom(15);
-
-  if (window._reservePreviewMarker) {
-    window._reservePreviewMarker.setMap(null);
-  }
-
-  window._reservePreviewMarker = new google.maps.Marker({
-    position,
-    map: googleMap,
-    icon: {
-      path: google.maps.SymbolPath.CIRCLE,
-      scale: 14,
-      fillColor: "#94a3b8",
-      fillOpacity: 0.9,
-      strokeColor: "white",
-      strokeWeight: 2
-    },
-    label: {
-      text: "?",
-      color: "white",
-      fontWeight: "bold",
-      fontSize: "12px"
-    },
-    title: card.querySelector(".reserve-card-name")?.textContent || ""
-  });
-
-  if (window._reserveInfoWindow) {
-    window._reserveInfoWindow.close();
-  }
   const trip = state.latestTrip;
   const place = (trip?.allCandidates || [])
     .find((candidate) => candidate.id === id);
+  if (!place) return;
 
-  window._reserveInfoWindow = new google.maps.InfoWindow({
-    content: `
-      <div style="max-width:200px;font-family:sans-serif">
-        <strong style="font-size:13px">
-          ${place?.name || ""}
-        </strong>
-        <p style="font-size:12px;color:#666;margin:4px 0">
-          ${place?.description || place?.formattedAddress || ""}
-        </p>
-        <p style="font-size:12px;margin:4px 0">
-          Score: ${place?.score}/100 · $${place?.cost}
-        </p>
-      </div>
-    `
+  if (googleMap && window.google && !Number.isNaN(lat) && !Number.isNaN(lng)) {
+    const position = { lat, lng };
+    googleMap.panTo(position);
+    googleMap.setZoom(15);
+
+    if (window._reservePreviewMarker) {
+      window._reservePreviewMarker.setMap(null);
+    }
+
+    window._reservePreviewMarker = new google.maps.Marker({
+      position,
+      map: googleMap,
+      icon: {
+        path: google.maps.SymbolPath.CIRCLE,
+        scale: 14,
+        fillColor: "#94a3b8",
+        fillOpacity: 0.9,
+        strokeColor: "white",
+        strokeWeight: 2
+      },
+      label: {
+        text: "?",
+        color: "white",
+        fontWeight: "bold",
+        fontSize: "12px"
+      },
+      title: card.querySelector(".reserve-card-name")?.textContent || ""
+    });
+  }
+
+  renderDetailModal(place, {
+    kicker: state.language === "en" ? "Reserve candidate" : "备选地点"
   });
-  window._reserveInfoWindow.open(googleMap, window._reservePreviewMarker);
+  const enriched = await fetchReservePlaceDetails(place);
+  if (enriched) {
+    Object.assign(place, enriched);
+    renderDetailModal(enriched, {
+      kicker: state.language === "en" ? "Reserve candidate" : "备选地点"
+    });
+  }
 });
 
 closeDialog.addEventListener("click", () => dialog.close());

@@ -19,7 +19,30 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json() as RouteMatrixRequestBody;
-    const { origins, destinations, travelMode } = body;
+    const { origins, destinations, travelMode = "DRIVE" } = body;
+    const googleTravelMode = travelMode === "DRIVING" ? "DRIVE" : travelMode;
+
+    if (!origins?.length || !destinations?.length) {
+      return NextResponse.json({ error: "Missing origins or destinations" }, { status: 400 });
+    }
+
+    if (googleTravelMode === "TRANSIT") {
+      const params = new URLSearchParams({
+        origin: `${origins[0].lat},${origins[0].lng}`,
+        destination: `${destinations[0].lat},${destinations[0].lng}`,
+        mode: "transit",
+        departure_time: "now",
+        key: apiKey
+      });
+      const url = `https://maps.googleapis.com/maps/api/directions/json?${params}`;
+      const res = await fetch(url);
+      const data = await res.json();
+      const leg = data.routes?.[0]?.legs?.[0];
+      return NextResponse.json(leg ? [{
+        duration: `${leg.duration?.value || 0}s`,
+        distanceMeters: leg.distance?.value || 0
+      }] : []);
+    }
 
     const url = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix";
     const payload = {
@@ -29,8 +52,8 @@ export async function POST(request: NextRequest) {
       destinations: destinations.map((destination) => ({
         waypoint: { location: { latLng: { latitude: destination.lat, longitude: destination.lng } } }
       })),
-      travelMode: "DRIVE",
-      routingPreference: travelMode === "DRIVING" ? "TRAFFIC_AWARE" : undefined,
+      travelMode: googleTravelMode,
+      routingPreference: googleTravelMode === "DRIVE" ? "TRAFFIC_AWARE" : undefined,
       languageCode: "en"
     };
 

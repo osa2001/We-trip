@@ -5,36 +5,32 @@ export default function Home() {
             <section className="onboarding-panel" aria-label="We-trip onboarding">
               <div className="brand-row">
                 <div className="brand-mark">We</div>
-                <div>
-                  <p className="eyebrow">We-trip AI</p>
-                  <h1 data-i18n="hero">把一群人的偏好合成一条可执行路线</h1>
+                <div className="brand-copy">
+                  <h1>WE-TRIP</h1>
+                  <p>多人旅行规划助手</p>
                 </div>
+                <button id="guide-button" className="text-button guide-trigger" type="button" data-i18n="guide">使用指引</button>
               </div>
 
               <form id="trip-form" className="trip-form">
                 <div className="field-grid">
-                  <label>
+                  <label data-guide-target="destination">
                     <span data-i18n="destination">目的地国家</span>
-                    <select id="country" name="country">
-                      <option value="Japan">Japan</option>
-                      <option value="England">England</option>
-                      <option value="France">France</option>
-                      <option value="Germany">Germany</option>
-                      <option value="Spain">Spain</option>
-                      <option value="Italy">Italy</option>
-                      <option value="Norway">Norway</option>
-                      <option value="Finland">Finland</option>
-                      <option value="USA">USA</option>
-                    </select>
+                    <input id="country" name="country" type="text" defaultValue="Japan" placeholder="搜索国家 / Search country" autoComplete="off" />
+                    <div id="country-tags" className="country-tags"></div>
                   </label>
-                  <div className="city-selector-section">
+                  <label data-guide-target="settings">
+                    <span data-i18n="days">旅行天数</span>
+                    <input id="days" name="days" type="number" min="2" max="10" defaultValue="5" />
+                  </label>
+
+                  <div className="city-selector-section field-span-2">
                     <label>
                       <span data-i18n="city">目的地城市</span>
                     </label>
                     <div className="city-tags" id="city-tags"></div>
                     <div className="city-add-row">
-                      <select id="city-add-select" className="city-add-select">
-                      </select>
+                      <input id="city-add-select" className="city-add-select" type="text" placeholder="搜索城市 / Search city" autoComplete="off" />
                       <button
                         type="button"
                         id="city-add-btn"
@@ -45,23 +41,32 @@ export default function Home() {
                     <select id="destination" name="destination" hidden>
                     </select>
                   </div>
-                  <label>
-                    <span data-i18n="days">旅行天数</span>
-                    <input id="days" name="days" type="number" min="2" max="10" defaultValue="5"  />
-                  </label>
+
                   <label>
                     <span data-i18n="travelerCount">出行人数</span>
                     <input id="traveler-count" name="travelerCount" type="number" min="1" max="20" defaultValue="4" />
                   </label>
                   <label>
+                    <span data-i18n="hotelStars">酒店星级</span>
+                    <select id="hotel-stars" name="hotelStars" defaultValue="3">
+                      <option value="1">1★</option>
+                      <option value="2">2★</option>
+                      <option value="3">3★</option>
+                      <option value="4">4★</option>
+                      <option value="5">5★</option>
+                    </select>
+                  </label>
+
+                  <label>
                     <span data-i18n="budgetMin">单人总行程预算下限</span>
-                    <input id="budget-min" name="budgetMin" type="number" min="200" step="50" defaultValue="800"  />
+                    <input id="budget-min" name="budgetMin" type="number" min="200" step="50" defaultValue="800" />
                   </label>
                   <label>
                     <span data-i18n="budgetMax">单人总行程预算上限</span>
-                    <input id="budget-max" name="budgetMax" type="number" min="300" step="50" defaultValue="1400"  />
+                    <input id="budget-max" name="budgetMax" type="number" min="300" step="50" defaultValue="1400" />
                   </label>
-                  <label>
+
+                  <label data-guide-target="surprise">
                     <span data-i18n="discovery">发现模式</span>
                     <select id="discovery-mode" name="discoveryMode">
                       <option value="on">Keep the surprise ON</option>
@@ -75,40 +80,26 @@ export default function Home() {
                       <option value="DRIVING">Driving</option>
                     </select>
                   </label>
-                  <label>
-                    <span data-i18n="hotelStars">酒店星级</span>
-                    <select id="hotel-stars" name="hotelStars" defaultValue="3">
-                      <option value="1">1★</option>
-                      <option value="2">2★</option>
-                      <option value="3">3★</option>
-                      <option value="4">4★</option>
-                      <option value="5">5★</option>
-                    </select>
-                  </label>
-                  <div className="field-group">
+
+                  <div className="flight-fieldset field-span-2">
                     <label>
                       <span data-i18n="departureAirport">出发机场</span>
-                      <select id="departure-airport" name="departureAirport">
-                        <option value="UNKNOWN">Unknown / 未定</option>
-                        <option value="NRT">Tokyo Narita (NRT)</option>
-                        <option value="HND">Tokyo Haneda (HND)</option>
-                        <option value="LHR">London Heathrow (LHR)</option>
-                        <option value="CDG">Paris CDG (CDG)</option>
-                        <option value="TXL">Berlin Brandenburg (BER)</option>
-                        <option value="FCO">Rome Fiumicino (FCO)</option>
-                        <option value="BCN">Barcelona El Prat (BCN)</option>
-                        <option value="OSL">Oslo Gardermoen (OSL)</option>
-                        <option value="HEL">Helsinki Vantaa (HEL)</option>
-                        <option value="JFK">New York JFK (JFK)</option>
-                        <option value="LAX">Los Angeles (LAX)</option>
-                        <option value="SFO">San Francisco (SFO)</option>
-                      </select>
+                      <input id="departure-airport" name="departureAirport" type="text" placeholder="搜索机场 / Search airport..." autoComplete="off" />
+                    </label>
+                    <label>
+                      <span data-i18n="arrivalAirport">到达机场</span>
+                      <input id="arrival-airport" name="arrivalAirport" type="text" placeholder="搜索机场 / Search airport..." autoComplete="off" />
                     </label>
                     <label id="flight-time-label">
                       <span data-i18n="flightDepartureTime">航班起飞时间（最后一天）</span>
                       <input id="flight-dep-time" name="flightDepTime" type="time" defaultValue="14:00" />
                     </label>
+                    <label id="arrival-time-label">
+                      <span data-i18n="flightArrivalTime">航班到达时间（第一天）</span>
+                      <input id="flight-arrival-time" name="flightArrivalTime" type="time" />
+                    </label>
                   </div>
+
                   <label>
                     <span data-i18n="nationality">主预订人国籍</span>
                     <select id="nationality" name="nationality">
@@ -141,24 +132,9 @@ export default function Home() {
                   <span data-i18n="travelerPrefs">每位同行者的氛围和必去地点</span>
                   <span className="pill">3.5 invites / trip</span>
                 </div>
-                <div id="traveler-list" className="traveler-list" aria-label="Traveler preference inputs"></div>
+                <div id="traveler-list" className="traveler-list" aria-label="Traveler preference inputs" data-guide-target="preferences"></div>
 
-                <div className="insight-strip" aria-label="Market validation">
-                  <div>
-                    <strong>70%+</strong>
-                    <span data-i18n="insight1">跨国多人游用户手动协调数天</span>
-                  </div>
-                  <div>
-                    <strong>8</strong>
-                    <span data-i18n="insight2">竞品基准分析</span>
-                  </div>
-                  <div>
-                    <strong>200</strong>
-                    <span data-i18n="insight3">冷启动 4 周种子用户</span>
-                  </div>
-                </div>
-
-                <button className="primary-button" type="submit">
+                <button className="primary-button" type="submit" data-guide-target="generate">
                   <span data-i18n="generate">合成团队行程</span>
                   <span aria-hidden="true">→</span>
                 </button>
@@ -173,9 +149,14 @@ export default function Home() {
                 </div>
                 <div className="header-actions">
                   <button id="regenerate" className="icon-button" type="button" title="重新生成">↻</button>
-                  <button id="share" className="secondary-button" type="button" data-i18n="share">邀请队友查看</button>
+                  <button id="export-pdf" className="secondary-button export-pdf-button" type="button" style={{display: "none"}} data-guide-target="export-pdf">导出 PDF</button>
+                  <button id="share" className="secondary-button" type="button" data-i18n="share" data-guide-target="invite">邀请队友查看</button>
                 </div>
               </div>
+
+              <p id="itinerary-disclaimer" className="itinerary-disclaimer">
+                * 所有时间均为当地时间 · 所有价格以美元（USD）计算，仅供参考
+              </p>
 
               <div id="alert-stack" className="alert-stack"></div>
 
@@ -213,7 +194,7 @@ export default function Home() {
                     ></div>
                   </div>
 
-                  <div id="reserve-pool-section" className="reserve-pool-section">
+                  <div id="reserve-pool-section" className="reserve-pool-section" data-guide-target="reserve">
                     <div className="reserve-pool-header">
                       <h3 id="reserve-pool-title">备选地点池</h3>
                       <span id="reserve-pool-count" className="reserve-count"></span>
@@ -238,11 +219,21 @@ export default function Home() {
             <div className="dialog-copy">
               <p id="detail-kicker" className="eyebrow"></p>
               <h3 id="detail-title"></h3>
-              <p id="detail-body"></p>
+              <div id="detail-body"></div>
             </div>
           </dialog>
 
           <div id="toast" className="toast" role="status" aria-live="polite"></div>
+          <div
+            id="pdf-export"
+            style={{
+              display: "none",
+              padding: "32px",
+              fontFamily: "sans-serif",
+              maxWidth: "700px",
+              margin: "0 auto",
+            }}
+          ></div>
     </>
   );
 }
