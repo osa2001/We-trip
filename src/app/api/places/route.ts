@@ -90,6 +90,40 @@ export async function GET(request: NextRequest) {
       const data = await res.json();
       return NextResponse.json(data);
 
+
+    } else if (type === "restaurants") {
+      const url = "https://places.googleapis.com/v1/places:searchNearby";
+      const body = {
+        locationRestriction: {
+          circle: {
+            center: { latitude: parseFloat(lat!), longitude: parseFloat(lng!) },
+            radius: 3000
+          }
+        },
+        includedTypes: [
+          "restaurant", "bar", "cafe", "bakery",
+          "chinese_restaurant", "japanese_restaurant", "korean_restaurant",
+          "italian_restaurant", "mexican_restaurant", "american_restaurant",
+          "seafood_restaurant", "ramen_restaurant", "sushi_restaurant",
+          "pizza_restaurant", "steak_house", "vegetarian_restaurant",
+          "vegan_restaurant", "dessert_shop", "ice_cream_shop", "food_court"
+        ],
+        maxResultCount: 20,
+        rankPreference: "DISTANCE",
+        languageCode: "en"
+      };
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Goog-Api-Key": apiKey,
+          "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.location,places.types,places.priceLevel,places.rating,places.userRatingCount,places.photos,places.primaryType,places.editorialSummary"
+        },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      return NextResponse.json(data);
+
     } else if (type === "hotels") {
       const minRating = searchParams.get("minRating") || "3.5";
       const destination = searchParams.get("destination") || "";

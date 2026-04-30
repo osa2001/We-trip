@@ -885,6 +885,55 @@ select {
   margin-bottom: 16px;
 }
 
+.manual-place-search {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.manual-place-search-row {
+  display: flex;
+  gap: 8px;
+}
+
+.manual-place-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border, var(--line));
+  border-radius: 8px;
+  background: var(--surface, var(--paper));
+  color: var(--text, var(--ink));
+  font-size: 13px;
+}
+
+.manual-place-search-btn {
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent, var(--teal));
+  color: white;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 700;
+  padding: 8px 12px;
+  white-space: nowrap;
+}
+
+.manual-place-results {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 10px;
+}
+
+.manual-place-photo {
+  width: 100%;
+  height: 92px;
+  object-fit: cover;
+  border-radius: 7px;
+  margin-bottom: 4px;
+}
+
 .reserve-pool-header h3 {
   font-size: 15px;
   font-weight: 600;
@@ -904,6 +953,15 @@ select {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
   gap: 10px;
+}
+
+.reserve-pool-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  margin: 0;
 }
 
 .reserve-card {
@@ -974,6 +1032,28 @@ select {
   text-decoration: underline;
 }
 
+.reserve-card-footer-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 2px;
+}
+
+.reserve-remove-btn {
+  border: 0;
+  background: transparent;
+  color: var(--muted, #7b8683);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 0;
+  opacity: 0.72;
+}
+
+.reserve-remove-btn:hover {
+  opacity: 1;
+  text-decoration: underline;
+}
+
 .reserve-card-meta {
   display: flex;
   align-items: center;
@@ -1008,6 +1088,117 @@ select {
   color: var(--coral, #d85d47);
   padding: 1px 6px;
   border-radius: 10px;
+}
+
+.restaurant-section {
+  margin-top: 16px;
+  padding: 20px;
+  background: var(--card, var(--panel));
+  border: 1px solid var(--border, var(--line));
+  border-radius: 12px;
+}
+
+.restaurant-day-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.restaurant-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.restaurant-refresh-btn {
+  border: 0;
+  background: transparent;
+  color: var(--accent, var(--teal));
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 0;
+}
+
+.restaurant-refresh-btn:hover {
+  text-decoration: underline;
+}
+
+.restaurant-day-tab {
+  border: 1px solid var(--border, var(--line));
+  background: var(--surface, var(--paper));
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 5px 10px;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.restaurant-day-tab.active,
+.restaurant-day-tab:hover {
+  border-color: var(--accent, var(--teal));
+  color: var(--accent, var(--teal));
+  background: rgba(15, 143, 115, 0.08);
+}
+
+.restaurant-list {
+  display: grid;
+  gap: 10px;
+}
+
+.restaurant-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.restaurant-spinner {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid rgba(28, 107, 122, 0.18);
+  border-top-color: var(--accent, var(--teal));
+  animation: restaurant-spin 0.8s linear infinite;
+}
+
+@keyframes restaurant-spin {
+  to { transform: rotate(360deg); }
+}
+
+.restaurant-card {
+  display: grid;
+  grid-template-columns: 74px 1fr;
+  gap: 10px;
+  align-items: stretch;
+  background: var(--surface, var(--paper));
+  border: 1px solid var(--border, var(--line));
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.restaurant-photo {
+  width: 74px;
+  height: 74px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: var(--surface2, #f3f4f6);
+}
+
+.restaurant-card-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: center;
+}
+
+.restaurant-distance-note {
+  color: var(--muted, #66746f);
+  font-size: 11px;
+  line-height: 1.35;
 }
 
 .landmark-badge {

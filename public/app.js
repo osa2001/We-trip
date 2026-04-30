@@ -19,6 +19,15 @@ let countryAutocomplete = null;
 let departureAirportAutocomplete = null;
 let arrivalAirportAutocomplete = null;
 const hotelAreaAutocompletes = new Map();
+let manualPlaceResults = [];
+let restaurantSection = null;
+let restaurantTabs = null;
+let restaurantList = null;
+let activeRestaurantDayIndex = 0;
+let recommendedRestaurantIds = new Set();
+const removedReserveStorageKey = "wetrip_removed_reserve_ids";
+const removedReserveSignatureKey = "wetrip_removed_reserve_signature";
+const manualReserveStorageKey = "wetrip_manual_reserve_places";
 const wishlistState = {
   counts: new Map(),
   mine: new Set()
@@ -57,18 +66,88 @@ function getMinRatingCount(destination) {
   return 50;
 }
 
-// 把 Google priceLevel 转换成 USD 估算费用
-const priceLevelToUSD = {
-  PRICE_LEVEL_FREE: 0,
-  PRICE_LEVEL_INEXPENSIVE: 12,
-  PRICE_LEVEL_MODERATE: 35,
-  PRICE_LEVEL_EXPENSIVE: 90,
-  PRICE_LEVEL_VERY_EXPENSIVE: 180
+function normalizeGooglePriceLevel(priceLevel) {
+  if (typeof priceLevel === "number") return priceLevel;
+  const priceMap = {
+    PRICE_LEVEL_FREE: 0,
+    PRICE_LEVEL_INEXPENSIVE: 1,
+    PRICE_LEVEL_MODERATE: 2,
+    PRICE_LEVEL_EXPENSIVE: 3,
+    PRICE_LEVEL_VERY_EXPENSIVE: 4
+  };
+  return priceMap[priceLevel];
+}
+
+function estimatePlaceCost(priceLevel, placeTypes, countryCode) {
+  const normalizedPriceLevel = normalizeGooglePriceLevel(priceLevel);
+  if (normalizedPriceLevel !== undefined && normalizedPriceLevel !== null) {
+    const priceMap = { 0: 0, 1: 15, 2: 35, 3: 65, 4: 120 };
+    return priceMap[normalizedPriceLevel] ?? 20;
+  }
+
+  const cc = countryCode || "default";
+  const ticketCost = {
+    museum: { JP: 12, FR: 15, GB: 0, US: 20, KR: 8, CN: 8, IT: 15, ES: 12, DE: 10, default: 12 },
+    art_gallery: { JP: 15, FR: 15, GB: 0, US: 25, KR: 8, CN: 10, default: 12 },
+    historical_landmark: { JP: 8, FR: 12, GB: 10, US: 15, KR: 5, CN: 8, IT: 15, default: 8 },
+    cultural_landmark: { JP: 8, FR: 10, GB: 8, US: 12, KR: 5, CN: 8, default: 8 },
+    tourist_attraction: { JP: 15, FR: 18, GB: 15, US: 25, KR: 10, CN: 10, IT: 18, default: 15 },
+    amusement_park: { JP: 60, US: 80, KR: 40, default: 50 },
+    zoo: { JP: 20, US: 25, KR: 15, default: 18 },
+    aquarium: { JP: 25, US: 30, KR: 18, default: 20 },
+    park: { default: 0 },
+    natural_feature: { default: 0 },
+    church: { default: 0 },
+    place_of_worship: { default: 0 }
+  };
+
+  for (const type of (placeTypes || [])) {
+    const costMap = ticketCost[type];
+    if (costMap) return costMap[cc] ?? costMap.default ?? 12;
+  }
+
+  return 15;
+}
+
+const restaurantTypeLabels = {
+  restaurant: ["🍽 餐厅", "🍽 Restaurant"],
+  chinese_restaurant: ["🍜 中餐", "🍜 Chinese"],
+  japanese_restaurant: ["🍣 日料", "🍣 Japanese"],
+  korean_restaurant: ["🥘 韩餐", "🥘 Korean"],
+  italian_restaurant: ["🍝 意餐", "🍝 Italian"],
+  mexican_restaurant: ["🌮 墨西哥", "🌮 Mexican"],
+  american_restaurant: ["🍔 美式", "🍔 American"],
+  seafood_restaurant: ["🦞 海鲜", "🦞 Seafood"],
+  bar: ["🍹 酒吧", "🍹 Bar"],
+  cafe: ["☕ 咖啡", "☕ Cafe"],
+  bakery: ["🥐 烘焙", "🥐 Bakery"],
+  dessert_shop: ["🍰 甜点", "🍰 Dessert"],
+  default: ["🍽 餐厅", "🍽 Restaurant"]
 };
+
+const restaurantPriceLabels = {
+  PRICE_LEVEL_FREE: "免费",
+  PRICE_LEVEL_INEXPENSIVE: "💰 $",
+  PRICE_LEVEL_MODERATE: "💰 $$",
+  PRICE_LEVEL_EXPENSIVE: "💰 $$$",
+  PRICE_LEVEL_VERY_EXPENSIVE: "💰 $$$$"
+};
+
+function restaurantTypeLabel(type) {
+  const label = restaurantTypeLabels[type] || restaurantTypeLabels.default;
+  return state.language === "en" ? label[1] : label[0];
+}
+
+function restaurantPriceLabel(priceLevel) {
+  if (typeof priceLevel === "number") {
+    return ["免费", "💰 $", "💰 $$", "💰 $$$", "💰 $$$$"][priceLevel] || "💰 价格未知";
+  }
+  return restaurantPriceLabels[priceLevel] || "💰 价格未知";
+}
 
 // 把 Google Places 结果转换成 app.js 的 place 格式
 function normalizePlaceFromAPI(apiPlace, vibe, cityCenter) {
-  const cost = priceLevelToUSD[apiPlace.priceLevel] ?? 25;
+  const cost = estimatePlaceCost(apiPlace.priceLevel, apiPlace.types, state.countryCode);
   // 把真实 GPS 坐标转换成 0-100 的相对坐标
   // 以城市中心为基准，±0.1 度范围映射到 0-100
   const xRange = 0.15;
@@ -100,7 +179,8 @@ function normalizePlaceFromAPI(apiPlace, vibe, cityCenter) {
     "",
     editorialSummary,
     apiPlace.id || "",
-    apiPlace.userRatingCount || 0
+    apiPlace.userRatingCount || 0,
+    apiPlace.types || []
   ];
 }
 
@@ -789,6 +869,18 @@ const guideSteps = [
     en: { title: "Reserve pool", description: "After the itinerary is generated, tap 🤍 to mark places you want to visit, or click 'Add to itinerary' to manually add a place to a specific day." }
   },
   {
+    key: "manual-search",
+    selector: "#manual-place-search",
+    zh: { title: "🔍 搜索并添加地点", description: "在备选池上方，你可以直接搜索任意地点（由 Google Places 提供）。搜索结果会显示地点照片、费用和位置，点击「加入行程」后选择加入哪一天。每位旅伴都可以独立搜索并添加，添加后会标注是谁加入的。" },
+    en: { title: "🔍 Search and add places", description: "Above the reserve pool, you can search for any place powered by Google Places. Results show photos, estimated cost, and location; click 'Add to itinerary' and choose a day. Each traveler can search and add independently, and additions are labeled with who added them." }
+  },
+  {
+    key: "restaurants",
+    selector: "#restaurant-recommendations-section",
+    zh: { title: "🍽 美食探索", description: "在备选池下方，We-trip 会根据每天的景点和酒店位置，自动推荐附近高分餐厅（3公里内）。每天最多推荐 3 家，类型不重复。点击「加入行程」可将餐厅加入当天行程。如更新行程后希望获取最新餐厅推荐，请点击餐厅推荐区域的「🔄 刷新推荐」按钮。" },
+    en: { title: "🍽 Food discovery", description: "Below the reserve pool, We-trip recommends highly rated nearby restaurants based on each day's stops and hotel location (Google rating 4.3+, within 3km). Each day shows up to 3 restaurants with distinct types. Click 'Add to itinerary' to add one to that day without counting toward the stop limit." }
+  },
+  {
     key: "export-pdf",
     selector: '[data-guide-target="export-pdf"]',
     zh: { title: "导出 PDF", description: "行程生成后，点击「导出 PDF」按钮，可以将完整行程保存为 PDF 文件，方便离线查看或分享给队友。" },
@@ -925,8 +1017,23 @@ function init() {
     loadSharedTrip(pathTripId).catch(console.error);
     return;
   }
-  restoreFromHash();
-  generateTrip().catch(console.error);
+  const shouldAutoGenerate = restoreFromHash();
+  if (shouldAutoGenerate) {
+    const waitForMaps = (resolve) => {
+      if (window.google && window.google.maps) {
+        resolve();
+      } else {
+        window.setTimeout(() => waitForMaps(resolve), 100);
+      }
+    };
+    new Promise(waitForMaps).then(() => {
+      window.setTimeout(() => {
+        generateTrip().catch(console.error);
+      }, 300);
+    });
+  } else {
+    generateTrip().catch(console.error);
+  }
   restoreInviteTripFromQuery().catch(console.error);
 }
 
@@ -1035,6 +1142,7 @@ function bindTravelerListEvents() {
       }, 300);
     }
   });
+
 }
 
 function updateFlightTimeVisibility() {
@@ -1603,6 +1711,22 @@ async function generateTrip(travelerOverride = null) {
   const discoveryMode = discoveryModeInput.value === "on";
   const transportMode = transportModeInput.value;
   const groupVibes = [...new Set(activeTravelers.flatMap((traveler) => traveler.vibes))];
+  resetRemovedReservePersistenceForNewRoadmap({
+    destination,
+    country,
+    cities: state.cities,
+    days,
+    budgetMin,
+    budgetMax,
+    discoveryMode,
+    transportMode,
+    hotelStars,
+    hotelAreas,
+    travelers: activeTravelers.map((traveler) => ({
+      vibes: traveler.vibes,
+      mustVisits: traveler.mustVisits
+    }))
+  });
 
   // 获取城市中心坐标
   let cityCenter = null;
@@ -1734,6 +1858,7 @@ async function generateTrip(travelerOverride = null) {
   });
 
   state.latestTrip = { destination, country, cities: state.cities, plan: prePlan, hotelAreas: geocodedHotels, budgetMin, budgetMax, days, discoveryMode, transportMode, hotelStars, groupVibes, cityCenter, arrivalAirport: state.arrivalAirport, flightArrivalTime: state.flightArrivalTime, cityTransferModes: state.cityTransferModes, day1MaxStops, ...roadmap };
+  recommendedRestaurantIds = new Set();
   state.activeIndex = 0;
   if (state.latestTrip) {
     const geocodedCandidates = await geocodePlaces(
@@ -2097,6 +2222,7 @@ function normalizePlace(place, index, source = "system") {
       editorialSummary: place.editorialSummary || "",
       googlePlaceId: place.googlePlaceId || place.placeId || "",
       userRatingCount: place.userRatingCount || 0,
+      types: place.types || [],
       nominations: place.nominations || []
     };
   }
@@ -2118,6 +2244,7 @@ function normalizePlace(place, index, source = "system") {
     editorialSummary: place[11] || "",
     googlePlaceId: place[12] || "",
     userRatingCount: place[13] || 0,
+    types: Array.isArray(place[14]) ? place[14] : [],
     index,
     source,
     nominations: []
@@ -2306,6 +2433,25 @@ function repairBudget(candidates, targetCount, budgetMax, days, transportMode = 
   return { kept: repaired, removed };
 }
 
+function estimateVisitDuration(place) {
+  const types = Array.isArray(place?.types) ? place.types : [];
+  const typeSet = new Set(types);
+  const name = (place?.name || "").toLowerCase();
+  const vibe = place?.vibe || "";
+
+  if (["amusement_park", "theme_park", "water_park"].some((type) => typeSet.has(type))) return 480;
+  if (["national_park", "nature_reserve"].some((type) => typeSet.has(type))) return 180;
+  if (/\b(palace|castle|forbidden|tower|louvre|british)\b/i.test(name)) return 150;
+  if (typeSet.has("zoo") || typeSet.has("aquarium")) return 150;
+  if (typeSet.has("museum") || typeSet.has("art_gallery") || vibe === "museum") return 90;
+  if (typeSet.has("park") || vibe === "nature") return 60;
+  if (types.some((type) => type.includes("market") || type.includes("food")) || vibe === "local-food") return 75;
+  if (["temple", "shrine", "church", "cathedral", "place_of_worship"].some((type) => typeSet.has(type)) || vibe === "history") return 75;
+  if (["landmark", "monument", "square", "tourist_attraction", "historical_landmark", "cultural_landmark"].some((type) => typeSet.has(type))) return 30;
+  if (types.some((type) => type.includes("shopping") || type.includes("store")) || vibe === "shopping") return 90;
+  return 60;
+}
+
 function clusterDays(places, hotelAreas, days, transportMode = "TRANSIT", day1MaxStops = 3) {
   console.log("clusterDays places with city:", places.map((place) => ({ name: place.name, city: place.city })));
   const k = days;
@@ -2320,6 +2466,7 @@ function clusterDays(places, hotelAreas, days, transportMode = "TRANSIT", day1Ma
     getDayHotel(index - 1)?.city &&
     getDayHotel(index).city !== getDayHotel(index - 1).city;
   const getDayStopCap = (index) => {
+    if (clusters[index]?.some((place) => estimateVisitDuration(place) >= 300)) return 1;
     if (index === 0) return day1MaxStops;
     if (isCitySwitchDay(index)) {
       const mode = getDayHotel(index)?.transferMode || state.cityTransferModes[index] || "train";
@@ -2365,15 +2512,18 @@ function clusterDays(places, hotelAreas, days, transportMode = "TRANSIT", day1Ma
           .filter((index) => index !== flightDayIndex && clusters[index].length < getDayStopCap(index))
           .sort((a, b) => clusters[a].length - clusters[b].length || a - b);
 
-        for (const dayIndex of availableDays) {
-          if (clusters[dayIndex].length >= getDayStopCap(dayIndex)) continue;
-          const dayHotel = getDayHotel(dayIndex);
-          const dayCity = dayHotel?.city || "";
-          if (!dayHotel || !dayCity) continue;
-          const candidateIndex = unassignedCityPlaces.findIndex((place) =>
-            place.city === dayCity &&
+      for (const dayIndex of availableDays) {
+        if (clusters[dayIndex].length >= getDayStopCap(dayIndex)) continue;
+        const dayHotel = getDayHotel(dayIndex);
+        const dayCity = dayHotel?.city || "";
+        if (!dayHotel || !dayCity) continue;
+        const dayHasFullDayPlace = clusters[dayIndex].some((place) => estimateVisitDuration(place) >= 300);
+        if (dayHasFullDayPlace) continue;
+        const candidateIndex = unassignedCityPlaces.findIndex((place) =>
+          place.city === dayCity &&
+            !(estimateVisitDuration(place) >= 300 && clusters[dayIndex].length > 0) &&
             travelTimeBetween(dayHotel, place, transportMode) <= fillThreshold
-          );
+        );
           if (candidateIndex === -1) continue;
           const [candidate] = unassignedCityPlaces.splice(candidateIndex, 1);
           clusters[dayIndex].push(candidate);
@@ -2432,6 +2582,10 @@ function clusterDays(places, hotelAreas, days, transportMode = "TRANSIT", day1Ma
 
     if (candidateIndex === undefined) return;
     const [candidate] = unassigned.splice(candidateIndex, 1);
+    if (estimateVisitDuration(candidate) >= 300 && cluster.length > 0) {
+      unassigned.push(candidate);
+      return;
+    }
     cluster.push(candidate);
     assignedIds.add(candidate.id);
   });
@@ -2460,6 +2614,10 @@ function clusterDays(places, hotelAreas, days, transportMode = "TRANSIT", day1Ma
 
       if (candidateIndex === undefined) break;
       const [candidate] = unassigned.splice(candidateIndex, 1);
+      if (estimateVisitDuration(candidate) >= 300 && cluster.length > 0) {
+        unassigned.push(candidate);
+        break;
+      }
       cluster.push(candidate);
       assignedIds.add(candidate.id);
     }
@@ -3142,6 +3300,7 @@ function renderTrip() {
   renderBudget(trip);
   renderGoogleMap(trip);
   renderReservePool(trip);
+  renderRestaurantSection(trip);
   renderItinerary(trip);
   updateHash(trip);
 }
@@ -3294,10 +3453,37 @@ function renderReservePool(trip) {
   if (!reservePoolList) return;
 
   if (reservePoolSection) reservePoolSection.style.display = "";
+  ensureManualPlaceSearchUI();
+  const reservePoolPending = !Array.isArray(trip.allCandidates);
+  if (reservePoolPending) {
+    if (reservePoolCount) reservePoolCount.textContent = "";
+    if (reservePoolTitle) {
+      reservePoolTitle.textContent = state.language === "en"
+        ? "Reserve candidate pool"
+        : "备选地点池";
+    }
+    reservePoolList.innerHTML = `
+      <p class="reserve-pool-loading">
+        <span class="restaurant-spinner"></span>
+        ${state.language === "en" ? "Loading reserve pool..." : "备选池加载中..."}
+      </p>`;
+    return;
+  }
+  if (!isSharedReservePoolMode()) {
+    const persistedManualPlaces = loadPersistedManualReservePlaces();
+    persistedManualPlaces.forEach((place) => {
+      if (!trip.allCandidates.some((candidate) => candidate.id === place.id)) {
+        trip.allCandidates.push(place);
+      }
+    });
+    const persistedRemovedIds = loadPersistedRemovedReserveIds();
+    trip.removedReserveIds = [...new Set([...(trip.removedReserveIds || []), ...persistedRemovedIds])];
+  }
 
   const finalIds = new Set(trip.places.map((place) => place.id));
+  const removedReserveIds = new Set(trip.removedReserveIds || []);
   const reserveCandidates = (trip.allCandidates || [])
-    .filter((place) => !finalIds.has(place.id))
+    .filter((place) => !finalIds.has(place.id) && !removedReserveIds.has(place.id))
     .sort((a, b) => {
       const aVotes = getWishlistCount(a.id);
       const bVotes = getWishlistCount(b.id);
@@ -3366,12 +3552,561 @@ function renderReservePool(trip) {
           </div>
           <div class="reserve-card-score">
             ${place.score}/100 ·
-            ${place.source === "nominated" ? "🏷 提名" : "🔍 推荐"}
+            ${sourceLabelHtml(place)}
+          </div>
+          <div class="reserve-card-footer-actions">
+            <button class="reserve-remove-btn"
+                    type="button"
+                    data-reserve-remove-id="${place.id}">
+              ${state.language === "en" ? "Remove" : "移除"}
+            </button>
           </div>
         </div>
       `;
     })
     .join("");
+}
+
+function sourceLabelHtml(place) {
+  if (place.source === "restaurant") return state.language === "en" ? "🍽 Restaurant" : "🍽 餐厅";
+  if (place.source === "manual") {
+    return place.addedBy
+      ? (state.language === "en" ? `🔍 Added by ${escapeHtml(place.addedBy)}` : `🔍 通过${escapeHtml(place.addedBy)}搜索添加`)
+      : (state.language === "en" ? "🔍 Added via user search" : "🔍 通过用户搜索添加");
+  }
+  if (place.source === "nominated") return state.language === "en" ? "🏷 Nominated" : "🏷 提名";
+  return state.language === "en" ? "🔍 Recommended" : "🔍 推荐";
+}
+
+function loadPersistedRemovedReserveIds() {
+  try {
+    const ids = JSON.parse(localStorage.getItem(removedReserveStorageKey) || "[]");
+    return Array.isArray(ids) ? ids.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+function loadPersistedManualReservePlaces() {
+  try {
+    const places = JSON.parse(localStorage.getItem(manualReserveStorageKey) || "[]");
+    return Array.isArray(places) ? places.filter((place) => place?.id) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveManualReservePlace(place) {
+  if (!place?.id) return;
+  const places = loadPersistedManualReservePlaces();
+  const next = places.some((item) => item.id === place.id) ? places : [...places, place];
+  localStorage.setItem(manualReserveStorageKey, JSON.stringify(next));
+}
+
+function removePersistedManualReservePlace(placeId) {
+  if (!placeId) return;
+  const next = loadPersistedManualReservePlaces().filter((place) => place.id !== placeId);
+  localStorage.setItem(manualReserveStorageKey, JSON.stringify(next));
+}
+
+function persistRemovedReserveIds(ids) {
+  localStorage.setItem(removedReserveStorageKey, JSON.stringify([...(new Set(ids || []))]));
+}
+
+function unremovePersistedReserveId(placeId) {
+  if (!placeId) return;
+  persistRemovedReserveIds(loadPersistedRemovedReserveIds().filter((id) => id !== placeId));
+}
+
+function roadmapSignatureFromInput(input) {
+  return JSON.stringify({
+    destination: input.destination,
+    country: input.country,
+    cities: input.cities,
+    days: input.days,
+    budgetMin: input.budgetMin,
+    budgetMax: input.budgetMax,
+    discoveryMode: input.discoveryMode,
+    transportMode: input.transportMode,
+    hotelStars: input.hotelStars,
+    hotelAreas: (input.hotelAreas || []).map((hotel) => ({
+      city: hotel.city,
+      id: hotel.id,
+      label: hotel.label,
+      lat: hotel.lat || null,
+      lng: hotel.lng || null,
+      transferMode: hotel.transferMode || ""
+    })),
+    travelers: input.travelers || []
+  });
+}
+
+function resetRemovedReservePersistenceForNewRoadmap(input) {
+  const signature = roadmapSignatureFromInput(input);
+  const previousSignature = localStorage.getItem(removedReserveSignatureKey);
+  if (previousSignature && previousSignature !== signature) {
+    localStorage.removeItem(removedReserveStorageKey);
+    localStorage.removeItem(manualReserveStorageKey);
+  }
+  localStorage.setItem(removedReserveSignatureKey, signature);
+}
+
+function ensureRestaurantSection() {
+  if (!reservePoolSection) return null;
+  if (!restaurantSection) {
+    restaurantSection = document.querySelector("#restaurant-recommendations-section");
+  }
+  if (restaurantSection) {
+    restaurantTabs = restaurantSection.querySelector("#restaurant-day-tabs");
+    restaurantList = restaurantSection.querySelector("#restaurant-list");
+    return restaurantSection;
+  }
+
+  restaurantSection = document.createElement("section");
+  restaurantSection.id = "restaurant-recommendations-section";
+  restaurantSection.className = "restaurant-section";
+  restaurantSection.innerHTML = `
+    <div class="reserve-pool-header">
+      <h3>${state.language === "en" ? "Restaurant recommendations" : "餐厅推荐"}</h3>
+      <div class="restaurant-header-actions">
+        <span class="reserve-count" id="restaurant-count"></span>
+        <button class="restaurant-refresh-btn" type="button">
+          ${state.language === "en" ? "🔄 Refresh" : "🔄 刷新推荐"}
+        </button>
+      </div>
+    </div>
+    <div class="restaurant-day-tabs" id="restaurant-day-tabs"></div>
+    <div class="restaurant-list" id="restaurant-list"></div>
+  `;
+  reservePoolSection.insertAdjacentElement("afterend", restaurantSection);
+  restaurantTabs = restaurantSection.querySelector("#restaurant-day-tabs");
+  restaurantList = restaurantSection.querySelector("#restaurant-list");
+  return restaurantSection;
+}
+
+function renderRestaurantSection(trip) {
+  const section = ensureRestaurantSection();
+  if (!section || !restaurantTabs || !restaurantList || !trip?.itineraryDays?.length) return;
+  section.style.display = "";
+  const title = section.querySelector("h3");
+  if (title) title.textContent = state.language === "en" ? "Restaurant recommendations" : "餐厅推荐";
+  const refreshButton = section.querySelector(".restaurant-refresh-btn");
+  if (refreshButton) refreshButton.textContent = state.language === "en" ? "🔄 Refresh" : "🔄 刷新推荐";
+
+  activeRestaurantDayIndex = Math.min(activeRestaurantDayIndex, trip.itineraryDays.length - 1);
+  restaurantTabs.innerHTML = trip.itineraryDays.map((day, index) => {
+    const zeroBasedDayIndex = index;
+    return `
+    <button class="restaurant-day-tab ${zeroBasedDayIndex === activeRestaurantDayIndex ? "active" : ""}"
+            type="button"
+            data-restaurant-day="${zeroBasedDayIndex}"
+            data-restaurant-day-index="${zeroBasedDayIndex}">
+      Day ${day.day}
+    </button>
+  `;
+  }).join("");
+
+  const cached = trip.restaurantRecommendations?.[activeRestaurantDayIndex];
+  if (cached) {
+    renderRestaurantCards(activeRestaurantDayIndex, cached);
+  } else {
+    restaurantList.innerHTML = `
+      <p class="muted">
+        ${state.language === "en" ? "Select a day to load nearby restaurants." : "点击某一天加载附近餐厅。"}
+      </p>
+    `;
+    const count = section.querySelector("#restaurant-count");
+    if (count) count.textContent = "";
+  }
+}
+
+async function loadRestaurantsForDay(dayIndex) {
+  const trip = state.latestTrip;
+  if (!trip?.itineraryDays?.[dayIndex] || !restaurantList) return;
+  trip.restaurantRecommendations = trip.restaurantRecommendations || {};
+  activeRestaurantDayIndex = dayIndex;
+  renderRestaurantSection(trip);
+
+  if (trip.restaurantRecommendations[dayIndex]) {
+    renderRestaurantCards(dayIndex, trip.restaurantRecommendations[dayIndex]);
+    return;
+  }
+
+  restaurantList.innerHTML = `
+    <p class="muted restaurant-loading">
+      <span class="restaurant-spinner"></span>
+      ${state.language === "en" ? "Loading restaurants..." : "餐厅加载中..."}
+    </p>
+  `;
+  const restaurants = await fetchRestaurantsForDay(trip, dayIndex);
+  trip.restaurantRecommendations[dayIndex] = restaurants;
+  renderRestaurantSection(trip);
+  renderRestaurantCards(dayIndex, restaurants);
+}
+
+async function fetchRestaurantsForDay(trip, dayIndex) {
+  const day = trip.itineraryDays[dayIndex];
+  const referencePoints = [trip.hotelAreas?.[dayIndex] || day.hotel, ...(day.places || [])]
+    .filter((point) => hasLatLng(point));
+  const firstPoint = referencePoints[0] || {};
+  console.log("fetchRestaurants triggered for day:", dayIndex, "lat:", firstPoint.lat, "lng:", firstPoint.lng);
+  const byId = new Map();
+
+  await Promise.all(referencePoints.map(async (point) => {
+    try {
+      const params = new URLSearchParams({
+        type: "restaurants",
+        lat: point.lat,
+        lng: point.lng
+      });
+      const res = await fetch(`/api/places?${params}`);
+      const data = await res.json();
+      console.log("restaurant API response:", data.places?.length, "places returned");
+      (data.places || []).forEach((apiPlace) => {
+        if (!apiPlace.id || !apiPlace.location) return;
+        const candidatePoint = {
+          lat: apiPlace.location.latitude,
+          lng: apiPlace.location.longitude
+        };
+        const distanceKm = haversineKm(point, candidatePoint);
+        const existing = byId.get(apiPlace.id);
+        if (!existing || distanceKm < existing.distanceKm) {
+          byId.set(apiPlace.id, { apiPlace, nearestPoint: point, distanceKm });
+        }
+      });
+    } catch (error) {
+      console.error(error);
+    }
+  }));
+
+  const candidates = [...byId.values()];
+  console.log("combined unique candidates after dedup:", candidates.length);
+  let filtered = candidates.filter(({ apiPlace }) =>
+    (apiPlace.rating || 0) >= 4.3 && (apiPlace.userRatingCount || 0) >= 50
+  );
+  if (filtered.length < 3) {
+    filtered = candidates.filter(({ apiPlace }) =>
+      (apiPlace.rating || 0) >= 4.0 && (apiPlace.userRatingCount || 0) >= 30
+    );
+  }
+  if (filtered.length < 3) {
+    filtered = candidates.filter(({ apiPlace }) =>
+      (apiPlace.rating || 0) >= 3.8 && (apiPlace.userRatingCount || 0) >= 20
+    );
+  }
+
+  const ranked = filtered
+    .map(({ apiPlace, nearestPoint, distanceKm }) => normalizeRestaurantFromAPI(apiPlace, nearestPoint, distanceKm, trip, dayIndex))
+    .sort((a, b) => b.restaurantScore - a.restaurantScore);
+
+  const picked = [];
+  const typeCount = new Map();
+  for (const restaurant of ranked) {
+    const restaurantKey = restaurant.googlePlaceId || restaurant.id;
+    if (recommendedRestaurantIds.has(restaurantKey)) continue;
+    const type = restaurant.primaryType || "restaurant";
+    const count = typeCount.get(type) || 0;
+    if (count >= 2) continue;
+    picked.push(restaurant);
+    recommendedRestaurantIds.add(restaurantKey);
+    typeCount.set(type, count + 1);
+    if (picked.length >= 6) break;
+  }
+  return picked;
+}
+
+function normalizeRestaurantFromAPI(apiPlace, nearestPoint, distanceKm, trip, dayIndex) {
+  const photoName = apiPlace.photos?.[0]?.name || null;
+  const image = photoName
+    ? `/api/photo?name=${encodeURIComponent(photoName)}`
+    : "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?auto=format&fit=crop&w=900&q=82";
+  const primaryType = apiPlace.primaryType || (apiPlace.types || []).find((type) => restaurantTypeLabels[type]) || "restaurant";
+  const rating = apiPlace.rating || 0;
+  const nearestPointName = formatNearestPointName(nearestPoint);
+  return {
+    id: `restaurant-${apiPlace.id}`,
+    googlePlaceId: apiPlace.id,
+    name: apiPlace.displayName?.text || apiPlace.name || "Restaurant",
+    vibe: "local-food",
+    source: "restaurant",
+    x: 50,
+    y: 50,
+    lat: apiPlace.location?.latitude || null,
+    lng: apiPlace.location?.longitude || null,
+    cost: estimatePlaceCost(apiPlace.priceLevel, apiPlace.types, state.countryCode),
+    route: state.language === "en" ? "Nearby dining" : "附近餐饮",
+    description: apiPlace.editorialSummary?.text || apiPlace.formattedAddress || "",
+    editorialSummary: apiPlace.editorialSummary?.text || "",
+    formattedAddress: apiPlace.formattedAddress || "",
+    image,
+    score: Math.round(rating * 20),
+    restaurantScore: rating * 0.6 + Math.max(0, 1 - distanceKm / 3) * 0.4,
+    rating,
+    userRatingCount: apiPlace.userRatingCount || 0,
+    priceLevel: apiPlace.priceLevel,
+    primaryType,
+    types: apiPlace.types || [],
+    distanceKm,
+    nearestPointName,
+    consensus: 70,
+    supporters: [],
+    nominations: [],
+    rationale: state.language === "en" ? "Restaurant recommendation near today's route" : "当天路线附近餐厅推荐",
+    city: trip.hotelAreas?.[dayIndex]?.city || dayCityFromTrip(trip) || ""
+  };
+}
+
+function formatNearestPointName(point) {
+  if (!point) return state.language === "en" ? "this route" : "当天路线";
+  if (point.label) return `${point.label}${state.language === "en" ? " hotel" : " 酒店"}`;
+  return point.name || point.displayName || (state.language === "en" ? "this stop" : "景点");
+}
+
+function dayCityFromTrip(trip) {
+  return trip?.cities?.[0] || state.cities?.[0] || trip?.destination || "";
+}
+
+function renderRestaurantCards(dayIndex, restaurants) {
+  if (!restaurantList) return;
+  const count = restaurantSection?.querySelector("#restaurant-count");
+  if (count) {
+    count.textContent = state.language === "en"
+      ? `${restaurants.length} places`
+      : `${restaurants.length} 个地点`;
+  }
+  if (!restaurants.length) {
+    restaurantList.innerHTML = `<p class="muted">${state.language === "en" ? "No restaurant recommendations nearby." : "附近暂无餐厅推荐。"}</p>`;
+    return;
+  }
+  restaurantList.innerHTML = restaurants.map((restaurant) => `
+    <article class="restaurant-card"
+             data-restaurant-id="${restaurant.id}"
+             data-restaurant-day="${dayIndex}">
+      ${restaurant.image ? `<img class="restaurant-photo" src="${restaurant.image}" alt="${escapeHtml(restaurant.name)}" />` : ""}
+      <div class="restaurant-card-body">
+        <div class="reserve-card-topline">
+          <div class="reserve-card-name">${escapeHtml(restaurant.name)}</div>
+          <button class="reserve-add-btn restaurant-add-btn"
+                  type="button"
+                  data-restaurant-id="${restaurant.id}"
+                  data-restaurant-day="${dayIndex}">
+            ${state.language === "en" ? "Add to itinerary" : "加入行程"}
+          </button>
+        </div>
+        <div class="restaurant-distance-note">
+          📍 ${state.language === "en" ? "About" : "距"} ${escapeHtml(restaurant.nearestPointName || "")} ${restaurant.distanceKm.toFixed(1)}km
+        </div>
+        <div class="reserve-card-meta">
+          <span class="reserve-card-vibe">${restaurantTypeLabel(restaurant.primaryType)}</span>
+          <span>⭐ ${restaurant.rating || "--"} · ${restaurant.userRatingCount || 0}</span>
+          <span>${restaurantPriceLabel(restaurant.priceLevel)}</span>
+        </div>
+      </div>
+    </article>
+  `).join("");
+}
+
+function syncRecommendedRestaurantIdsFromTrip(trip) {
+  recommendedRestaurantIds = new Set();
+  const recommendations = trip?.restaurantRecommendations || {};
+  Object.values(recommendations).flat().forEach((restaurant) => {
+    if (restaurant?.id || restaurant?.googlePlaceId) {
+      recommendedRestaurantIds.add(restaurant.googlePlaceId || restaurant.id);
+    }
+  });
+}
+
+function renderRestaurantDetailModal(restaurant, dayIndex) {
+  if (!restaurant) return;
+  detailImage.src = restaurant.image || "https://images.unsplash.com/photo-1555396273-367ea4eb4db5?auto=format&fit=crop&w=900&q=82";
+  detailImage.alt = restaurant.name || "";
+  detailKicker.textContent = state.language === "en" ? "Restaurant recommendation" : "餐厅推荐";
+  detailTitle.textContent = restaurant.name || "";
+
+  const typeLabel = restaurantTypeLabel(restaurant.primaryType);
+  const description = restaurant.editorialSummary || restaurant.description || typeLabel;
+  const distanceText = `${state.language === "en" ? "About" : "距"} ${restaurant.nearestPointName || ""} ${restaurant.distanceKm.toFixed(1)}km`;
+  const metadataRows = [
+    [state.language === "en" ? "Type" : "类型", typeLabel],
+    restaurant.formattedAddress ? [state.language === "en" ? "Address" : "地址", restaurant.formattedAddress] : null,
+    [state.language === "en" ? "Price level" : "价格等级", restaurantPriceLabel(restaurant.priceLevel)],
+    [state.language === "en" ? "Google rating" : "Google 评分", `⭐ ${restaurant.rating || "--"} (${restaurant.userRatingCount || 0} ${state.language === "en" ? "reviews" : "条评价"})`],
+    [state.language === "en" ? "Distance" : "距离", `📍 ${distanceText}`]
+  ].filter(Boolean);
+
+  detailBody.innerHTML = `
+    <div class="reserve-card-meta" style="margin-bottom:10px">
+      <span class="reserve-card-vibe">${escapeHtml(typeLabel)}</span>
+    </div>
+    ${description ? `<p class="detail-summary">${escapeHtml(description)}</p>` : ""}
+    <div class="detail-meta">
+      ${metadataRows.map(([label, value]) => `
+        <div><strong>${escapeHtml(label)}:</strong> ${escapeHtml(value)}</div>
+      `).join("")}
+    </div>
+    <button class="primary-button restaurant-detail-add-btn"
+            type="button"
+            data-restaurant-id="${restaurant.id}"
+            data-restaurant-day="${dayIndex}">
+      ${state.language === "en" ? "Add to itinerary" : "加入行程"}
+    </button>
+  `;
+  detailBody.style.display = "";
+  if (!dialog.open) dialog.showModal();
+}
+
+function ensureManualPlaceSearchUI() {
+  if (!reservePoolSection || reservePoolSection.querySelector("#manual-place-search")) return;
+  const wrapper = document.createElement("div");
+  wrapper.id = "manual-place-search";
+  wrapper.className = "manual-place-search";
+  wrapper.innerHTML = `
+    <div class="manual-place-search-row">
+      <input id="manual-place-query"
+             class="manual-place-input"
+             type="search"
+             placeholder="${state.language === "en" ? "Search and add a place..." : "搜索并添加地点..."}" />
+      <button id="manual-place-search-btn" class="manual-place-search-btn" type="button">
+        ${state.language === "en" ? "Search" : "搜索"}
+      </button>
+    </div>
+    <div id="manual-place-results" class="manual-place-results"></div>
+  `;
+  reservePoolSection.insertBefore(wrapper, reservePoolSection.firstChild);
+
+  wrapper.querySelector("#manual-place-search-btn")?.addEventListener("click", () => {
+    searchManualPlaces({ addedBy: currentManualSearchMemberName() }).catch(console.error);
+  });
+  wrapper.querySelector("#manual-place-query")?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter") return;
+    event.preventDefault();
+    searchManualPlaces({ addedBy: currentManualSearchMemberName() }).catch(console.error);
+  });
+}
+
+function currentManualSearchMemberName() {
+  if (sharedTripId && currentSharedMemberName) return currentSharedMemberName;
+  return travelers[0]?.name || "";
+}
+
+async function searchManualPlaces(options = {}) {
+  const input = options.input || document.querySelector("#manual-place-query");
+  const resultsEl = options.resultsEl || document.querySelector("#manual-place-results");
+  const query = options.query || input?.value?.trim();
+  const addedBy = options.addedBy || currentManualSearchMemberName();
+  if (!query || !resultsEl) return;
+
+  resultsEl.innerHTML = `<p class="muted">${state.language === "en" ? "Searching..." : "搜索中..."}</p>`;
+  const trip = state.latestTrip;
+  const city = state.cities?.[0] || trip?.destination || destinationInput.value || "";
+  const center = cityCentersCache[city] || trip?.cityCenter || await getCityCenter(city, countryInput.value);
+  const params = new URLSearchParams({
+    query: `${query} ${city} ${countryInput.value}`.trim(),
+    type: "nomination"
+  });
+  if (center?.lat && center?.lng) {
+    params.set("lat", center.lat);
+    params.set("lng", center.lng);
+  }
+
+  try {
+    const res = await fetch(`/api/places?${params}`);
+    const data = await res.json();
+    const rawPlaces = (data.places || []).slice(0, 5);
+    manualPlaceResults = await Promise.all(rawPlaces.map(async (apiPlace, index) => {
+      const inferredVibe = inferVibeFromPlaceTypes(apiPlace.types);
+      const placeArray = normalizePlaceFromAPI(apiPlace, inferredVibe, center || { lat: apiPlace.location?.latitude, lng: apiPlace.location?.longitude });
+      const normalized = normalizePlace(placeArray, 9000 + index, "manual");
+      const withCity = await assignCityToPlace({
+        ...normalized,
+        source: "manual",
+        addedBy,
+        score: Math.max(normalized.score || 0, 72),
+        consensus: normalized.consensus || 70,
+        rationale: addedBy
+          ? (state.language === "en" ? `Manually added by ${addedBy}` : `由 ${addedBy} 手动添加`)
+          : (state.language === "en" ? "Manually added by user search" : "通过用户搜索添加"),
+        supporters: normalized.supporters || [],
+        nominations: normalized.nominations || []
+      });
+      return withCity;
+    }));
+
+    renderManualPlaceResults(manualPlaceResults, resultsEl);
+  } catch (error) {
+    console.error(error);
+    resultsEl.innerHTML = `<p class="muted">${state.language === "en" ? "Search failed." : "搜索失败。"}</p>`;
+  }
+}
+
+function inferVibeFromPlaceTypes(types = []) {
+  return vibeOptions.find(([vibe]) =>
+    (vibeToPlaceTypes[vibe] || "").split(",").some((type) => types.includes(type))
+  )?.[0] || "hidden";
+}
+
+function renderManualPlaceResults(results, targetEl = null) {
+  const resultsEl = targetEl || document.querySelector("#manual-place-results");
+  if (!resultsEl) return;
+  if (!results.length) {
+    resultsEl.innerHTML = `<p class="muted">${state.language === "en" ? "No places found." : "没有找到地点。"}</p>`;
+    return;
+  }
+
+  resultsEl.innerHTML = results.map((place) => `
+    <div class="reserve-card manual-result-card"
+         data-manual-id="${place.id}"
+         data-lat="${place.lat || ""}"
+         data-lng="${place.lng || ""}">
+      ${place.image ? `<img class="manual-place-photo" src="${place.image}" alt="${escapeHtml(place.name)}" />` : ""}
+      <div class="reserve-card-topline">
+        <div class="reserve-card-name">📍 ${escapeHtml(place.name)}</div>
+        <div class="reserve-card-actions">
+          <button class="manual-add-btn reserve-add-btn"
+                  type="button"
+                  data-manual-add-id="${place.id}"
+                  data-added-by="${escapeHtml(place.addedBy || "")}">
+            ${state.language === "en" ? "Add to itinerary" : "加入行程"}
+          </button>
+          <button class="manual-reserve-btn reserve-add-btn"
+                  type="button"
+                  data-manual-reserve-id="${place.id}">
+            ${state.language === "en" ? "Add to reserve" : "加入备选池"}
+          </button>
+        </div>
+      </div>
+      <div class="reserve-card-meta">
+        <span class="reserve-card-vibe">${vibeLabel(place.vibe)}</span>
+        <span class="reserve-card-cost">$${place.cost}</span>
+        ${landmarkBadgeHtml(place)}
+      </div>
+      <div class="reserve-card-score">
+        <span class="landmark-badge">${sourceLabelHtml(place)}</span>
+      </div>
+    </div>
+  `).join("");
+}
+
+function previewManualPlaceOnMap(place) {
+  if (!place?.lat || !place?.lng || !googleMap || !window.google) return;
+  const position = { lat: place.lat, lng: place.lng };
+  googleMap.panTo(position);
+  googleMap.setZoom(15);
+  if (window._manualPreviewMarker) window._manualPreviewMarker.setMap(null);
+  window._manualPreviewMarker = new google.maps.Marker({
+    position,
+    map: googleMap,
+    label: { text: "✏", color: "white", fontWeight: "bold", fontSize: "12px" },
+    icon: {
+      path: google.maps.SymbolPath.CIRCLE,
+      scale: 14,
+      fillColor: "#1c6b7a",
+      fillOpacity: 0.95,
+      strokeColor: "white",
+      strokeWeight: 2
+    },
+    title: place.name
+  });
 }
 
 function getWishlistCount(placeId) {
@@ -3382,6 +4117,10 @@ function getWishlistCount(placeId) {
 function isPlaceWishlisted(placeId) {
   if (sharedTripId || activeInviteTrip?.id) return wishlistState.mine.has(placeId);
   return localWishlist.has(placeId);
+}
+
+function isSharedReservePoolMode() {
+  return Boolean(sharedTripId || activeInviteTrip?.id || window._activeTripId);
 }
 
 function canEditItinerary() {
@@ -3474,6 +4213,73 @@ async function removeItineraryStop(dayIndex, stopIndex) {
   await finishItineraryEdit(trip, state.language === "en" ? "Stop removed" : "已移出");
 }
 
+function mergeReservePoolRemoval(placeId, { persistLocal = true, render = true } = {}) {
+  const trip = state.latestTrip;
+  if (!trip || !placeId) return;
+  trip.removedReserveIds = [...new Set([...(trip.removedReserveIds || []), placeId])];
+  if (persistLocal) {
+    persistRemovedReserveIds(trip.removedReserveIds);
+    removePersistedManualReservePlace(placeId);
+  }
+  trip.allCandidates = (trip.allCandidates || []).filter((place) => place.id !== placeId);
+  if (render) renderReservePool(trip);
+}
+
+function broadcastReservePoolRemoval(placeId) {
+  const tripId = sharedTripId || activeInviteTrip?.id || window._activeTripId;
+  if (!tripId || !activeMembersChannel || !placeId) return;
+  activeMembersChannel.send({
+    type: "broadcast",
+    event: "reserve-place-remove",
+    payload: { placeId }
+  }).catch(console.error);
+}
+
+function removeReservePoolPlace(placeId) {
+  mergeReservePoolRemoval(placeId, {
+    persistLocal: !isSharedReservePoolMode(),
+    render: true
+  });
+  broadcastReservePoolRemoval(placeId);
+  if (sharedTripId || activeInviteTrip?.id || window._activeTripId) {
+    persistGeneratedItinerary().catch(console.error);
+  }
+}
+
+function mergeManualPlaceIntoReservePool(place, { persistLocal = true, showMessage = false } = {}) {
+  const trip = state.latestTrip;
+  if (!trip || !place) return;
+  trip.allCandidates = Array.isArray(trip.allCandidates) ? trip.allCandidates : [];
+  if (!trip.allCandidates.some((candidate) => candidate.id === place.id)) {
+    trip.allCandidates.push(place);
+  }
+  if (persistLocal) saveManualReservePlace(place);
+  trip.removedReserveIds = (trip.removedReserveIds || []).filter((id) => id !== place.id);
+  unremovePersistedReserveId(place.id);
+  renderReservePool(trip);
+  if (showMessage) {
+    showToast(state.language === "en" ? "Added to reserve pool" : "已加入备选池");
+  }
+}
+
+function broadcastManualReservePlace(place) {
+  const tripId = sharedTripId || activeInviteTrip?.id || window._activeTripId;
+  if (!tripId || !activeMembersChannel || !place) return;
+  activeMembersChannel.send({
+    type: "broadcast",
+    event: "reserve-place",
+    payload: { place }
+  }).catch(console.error);
+}
+
+function addManualPlaceToReservePool(place) {
+  mergeManualPlaceIntoReservePool(place, { persistLocal: true, showMessage: true });
+  broadcastManualReservePlace(place);
+  if (sharedTripId || activeInviteTrip?.id || window._activeTripId) {
+    persistGeneratedItinerary().catch(console.error);
+  }
+}
+
 async function addReservePlaceToDay(place, dayIndex) {
   const trip = state.latestTrip;
   const day = trip?.itineraryDays?.[dayIndex];
@@ -3487,7 +4293,9 @@ async function addReservePlaceToDay(place, dayIndex) {
     day.places.push({ ...place, isSubstitute: false });
   }
   const startPoint = getDayStartPoint(trip.hotelAreas, dayIndex, day.hotel);
-  day.places = orderRoute(day.places, startPoint, trip.transportMode);
+  if (place.source !== "manual" && place.source !== "restaurant") {
+    day.places = orderRoute(day.places, startPoint, trip.transportMode);
+  }
   await recalculateDayTravel(trip, dayIndex);
   await finishItineraryEdit(trip, state.language === "en" ? "Added to itinerary" : "已加入行程");
 }
@@ -3726,7 +4534,14 @@ function renderItinerary(trip) {
         globalIndex += 1;
         const transport = transportIconForLeg(day.legs[index]);
         const leg = day.legs[index];
-        const names = [...new Set([...place.nominations.map((item) => item.member), ...place.supporters.map((traveler) => traveler.name)])].join("、") || "系统推荐";
+        const names = place.source === "manual"
+          ? (place.addedBy
+            ? (state.language === "en" ? `Added by ${place.addedBy}` : `通过${place.addedBy}搜索添加`)
+            : (state.language === "en" ? "Added via user search" : "通过用户搜索添加"))
+          : place.source === "restaurant"
+            ? (state.language === "en" ? "Restaurant recommendation" : "餐厅推荐")
+            : [...new Set([...place.nominations.map((item) => item.member), ...place.supporters.map((traveler) => traveler.name)])].join("、") || "系统推荐";
+        const sourceIcon = place.source === "manual" ? "✏️ " : place.source === "restaurant" ? "🍽 " : "";
         return `
           <article class="place-card" data-index="${currentIndex}">
             <div class="place-line">
@@ -3745,7 +4560,7 @@ function renderItinerary(trip) {
                   margin-right: 6px;
                   vertical-align: middle;
 	                ">${index + 1}</span>
-	                ${place.name}${place.isSubstitute ? " · SUBSTITUTE" : ""}
+	                ${sourceIcon}${place.name}${place.isSubstitute ? " · SUBSTITUTE" : ""}
 	              </h3>
 	              <div class="place-card-actions">
 	                <strong>${place.score}/100</strong>
@@ -3838,7 +4653,13 @@ function renderDetailModal(place, options = {}) {
   const matchReason = [
     place.rationale,
     nominatedBy.length ? (state.language === "en" ? `Nominated by ${nominatedBy.join(", ")}` : `成员提名：${nominatedBy.join("、")}`) : "",
-    place.source && place.source !== "nominated" ? (state.language === "en" ? "System discovery candidate" : "系统发现候选") : ""
+    place.source === "manual"
+      ? (place.addedBy
+        ? (state.language === "en" ? `Added by ${place.addedBy} via search` : `通过${place.addedBy}搜索添加`)
+        : (state.language === "en" ? "Added via user search" : "通过用户搜索添加"))
+      : place.source && place.source !== "nominated"
+        ? (state.language === "en" ? "System discovery candidate" : "系统发现候选")
+        : ""
   ].filter(Boolean).join(" · ");
   const vibeMatch = supporters.length
     ? supporters.join(state.language === "en" ? ", " : "、")
@@ -3949,6 +4770,7 @@ function updateHash(trip) {
     arrivalAirport: state.arrivalAirport,
     arrivalTime: state.flightArrivalTime,
     cityTransferModes: state.cityTransferModes,
+    autoGenerate: true,
     travelers: travelers.map((traveler) => ({
       vibes: traveler.vibes,
       mustVisits: traveler.mustVisits
@@ -3958,7 +4780,7 @@ function updateHash(trip) {
 }
 
 function restoreFromHash() {
-  if (!location.hash) return;
+  if (!location.hash) return false;
 
   try {
     const payload = JSON.parse(decodeURIComponent(location.hash.slice(1)));
@@ -4022,8 +4844,15 @@ function restoreFromHash() {
       });
     }
     renderTravelers();
+    const hasRestoredRoadmapParams = Boolean(
+      destinationInput.value &&
+      daysInput.value &&
+      Array.isArray(payload.travelers)
+    );
+    return payload.autoGenerate === true || hasRestoredRoadmapParams;
   } catch {
     showToast("分享链接参数无法识别，已使用默认行程");
+    return false;
   }
 }
 
@@ -4093,12 +4922,20 @@ async function persistGeneratedItinerary() {
     const supabase = await getSupabaseBrowserClient();
     const { error } = await supabase
       .from("trips")
-      .update({ generated_itinerary: state.latestTrip })
+      .update({ generated_itinerary: prepareItineraryForPersistence(state.latestTrip) })
       .eq("id", tripId);
     if (error) console.error(error);
   } catch (error) {
     console.error(error);
   }
+}
+
+function prepareItineraryForPersistence(trip) {
+  const copy = JSON.parse(JSON.stringify(trip));
+  // Keep allCandidates so shared pages can render the same reserve pool after refresh.
+  // removedReserveIds is local/session preference and should not hide candidates for everyone.
+  delete copy.removedReserveIds;
+  return copy;
 }
 
 function memberToTraveler(member, index) {
@@ -4350,7 +5187,22 @@ async function subscribeInviteProgress(tripId) {
     })
     .on("broadcast", { event: "itinerary" }, ({ payload }) => {
       state.latestTrip = payload;
+      syncRecommendedRestaurantIdsFromTrip(state.latestTrip);
       renderTrip();
+    })
+    .on("broadcast", { event: "reserve-place" }, ({ payload }) => {
+      if (!payload?.place) return;
+      mergeManualPlaceIntoReservePool(payload.place, {
+        persistLocal: true,
+        showMessage: false
+      });
+    })
+    .on("broadcast", { event: "reserve-place-remove" }, ({ payload }) => {
+      if (!payload?.placeId) return;
+      mergeReservePoolRemoval(payload.placeId, {
+        persistLocal: !isSharedReservePoolMode(),
+        render: true
+      });
     })
     .subscribe();
   await renderInviteProgress(tripId);
@@ -4437,6 +5289,8 @@ async function loadSharedTrip(tripId) {
   applyTripPayloadToForm(trip);
   if (trip.generated_itinerary) {
     state.latestTrip = trip.generated_itinerary;
+    delete state.latestTrip.removedReserveIds;
+    syncRecommendedRestaurantIdsFromTrip(state.latestTrip);
     state.activeIndex = 0;
   }
   const { data: members, error: membersError } = await supabase
@@ -4449,6 +5303,11 @@ async function loadSharedTrip(tripId) {
   setSharedTripPermissions();
   if (state.latestTrip) renderTrip();
   await subscribeInviteProgress(tripId);
+  if (trip.generated_itinerary && !Array.isArray(trip.generated_itinerary.allCandidates)) {
+    window.setTimeout(() => {
+      generateTrip((members || []).map(memberToTraveler)).catch(console.error);
+    }, 500);
+  }
   if (!storedMemberName) {
     showIdentityModal(tripId, members || []);
   }
@@ -4810,11 +5669,95 @@ itineraryList.addEventListener("click", (event) => {
 });
 
 document.addEventListener("click", async (event) => {
+  const restaurantRefreshButton = event.target.closest(".restaurant-refresh-btn");
+  if (restaurantRefreshButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const trip = state.latestTrip;
+    if (trip?.restaurantRecommendations) {
+      delete trip.restaurantRecommendations[activeRestaurantDayIndex];
+    }
+    loadRestaurantsForDay(activeRestaurantDayIndex).catch(console.error);
+    return;
+  }
+
+  const restaurantTab = event.target.closest(".restaurant-day-tab");
+  if (restaurantTab) {
+    event.preventDefault();
+    event.stopPropagation();
+    const dayIndex = Number(restaurantTab.dataset.restaurantDayIndex ?? restaurantTab.dataset.restaurantDay ?? 0);
+    loadRestaurantsForDay(dayIndex).catch(console.error);
+    return;
+  }
+
+  const restaurantAddButton = event.target.closest(".restaurant-add-btn");
+  if (restaurantAddButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const dayIndex = Number(restaurantAddButton.dataset.restaurantDay);
+    const restaurant = state.latestTrip?.restaurantRecommendations?.[dayIndex]
+      ?.find((place) => place.id === restaurantAddButton.dataset.restaurantId);
+    if (restaurant) {
+      await addReservePlaceToDay(restaurant, dayIndex);
+    }
+    return;
+  }
+
+  const restaurantCard = event.target.closest(".restaurant-card");
+  if (restaurantCard) {
+    event.preventDefault();
+    event.stopPropagation();
+    const dayIndex = Number(restaurantCard.dataset.restaurantDay);
+    const restaurant = state.latestTrip?.restaurantRecommendations?.[dayIndex]
+      ?.find((place) => place.id === restaurantCard.dataset.restaurantId);
+    if (restaurant) renderRestaurantDetailModal(restaurant, dayIndex);
+    return;
+  }
+
+  const manualAddButton = event.target.closest(".manual-add-btn");
+  if (manualAddButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const place = manualPlaceResults.find((candidate) => candidate.id === manualAddButton.dataset.manualAddId)
+      || state.latestTrip?.allCandidates?.find((candidate) => candidate.id === manualAddButton.dataset.manualAddId);
+    if (place) showAddToItineraryModal(place);
+    return;
+  }
+
+  const manualReserveButton = event.target.closest(".manual-reserve-btn");
+  if (manualReserveButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    const place = manualPlaceResults.find((candidate) => candidate.id === manualReserveButton.dataset.manualReserveId);
+    if (place) addManualPlaceToReservePool(place);
+    return;
+  }
+
+  const manualCard = event.target.closest(".manual-result-card");
+  if (manualCard) {
+    const place = manualPlaceResults.find((candidate) => candidate.id === manualCard.dataset.manualId)
+      || state.latestTrip?.allCandidates?.find((candidate) => candidate.id === manualCard.dataset.manualId);
+    if (place) {
+      renderDetailModal(place, {
+        kicker: state.language === "en" ? "Search result" : "搜索结果"
+      });
+    }
+    return;
+  }
+
   const wishlistButton = event.target.closest(".reserve-wishlist-btn");
   if (wishlistButton) {
     event.preventDefault();
     event.stopPropagation();
     await toggleReserveWishlist(wishlistButton.dataset.wishlistId);
+    return;
+  }
+
+  const reserveRemoveButton = event.target.closest(".reserve-remove-btn");
+  if (reserveRemoveButton) {
+    event.preventDefault();
+    event.stopPropagation();
+    removeReservePoolPlace(reserveRemoveButton.dataset.reserveRemoveId);
     return;
   }
 
@@ -4888,6 +5831,22 @@ document.addEventListener("click", async (event) => {
 });
 
 closeDialog.addEventListener("click", () => dialog.close());
+dialog.addEventListener("click", (event) => {
+  if (event.target === dialog) dialog.close();
+});
+detailBody.addEventListener("click", (event) => {
+  const addButton = event.target.closest(".restaurant-detail-add-btn");
+  if (!addButton) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const dayIndex = Number(addButton.dataset.restaurantDay);
+  const restaurant = state.latestTrip?.restaurantRecommendations?.[dayIndex]
+    ?.find((place) => place.id === addButton.dataset.restaurantId);
+  if (restaurant) {
+    dialog.close();
+    showAddToItineraryModal(restaurant);
+  }
+});
 
 console.log("app.js loaded");
 console.log("travelerList at load time:", document.querySelector("#traveler-list"));
